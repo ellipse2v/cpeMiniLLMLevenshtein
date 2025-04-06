@@ -23,6 +23,8 @@ from tqdm import tqdm
 import re
 import Levenshtein
 import time
+import argparse
+import pandas as pd
 
 # Configuration
 class Config:
@@ -288,42 +290,67 @@ def find_closest_cpes(vendor, product, version, cpe_items, titles, embeddings, m
     # Return only the top N results
     return results[:num_results]
 
-def main():
-    print("\n=== CPE Matcher with MiniLM and Levenshtein ===")
-    print(f"Using PyTorch version: {torch.__version__}")
-    if torch.cuda.is_available():
-        print(f"CUDA version: {torch.version.cuda}")
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        n_gpu = torch.cuda.device_count()
-        print(f"Available GPUs: {n_gpu}")
+def process_excel_file(excel_path, cpe_items, titles, embeddings, model, device):
+    """Process an Excel file with vendor, product, and version data to find CPE codes."""
+    try:
+        print(f"Loading Excel file: {excel_path}")
+        df = pd.read_excel(excel_path)
+        
+        # Verify the Excel structure
+        required_columns = ['Vendor', 'Product', 'Version', 'CPE', 'Levenshtein score']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        
+        if missing_columns:
+            print(f"Error: Missing required columns: {', '.join(missing_columns)}")
+            print("Required columns: A (Vendor), B (Product), C (Version), D (CPE), E (Levenshtein score)")
+            return False
+        
+        total_rows = len(df)
+        processed_count = 0
+        updated_count = 0
+        
+        print(f"Processing {total_rows} entries...")
+        
+        # Process each row
+        for index, row in tqdm(df.iterrows(), total=total_rows, desc="Processing Excel data"):
+            vendor = str(row['Vendor']) if not pd.isna(row['Vendor']) else ""
+            product = str(row['Product']) if not pd.isna(row['Product']) else ""
+            version = str(row['Version']) if not pd.isna(row['Version']) else ""
+            
+            if not product:  # Product is required
+                continue
+            
+            # Find closest CPE codes
+            results = find_closest_cpes(vendor, product, version, cpe_items, titles, embeddings, model, device, num_results=1)
+            
+            processed_count += 1
+            
+            if results:
+                score, cpe, _ = results[0]
+                
+                # Only update if the Levenshtein score is above 0.7
+                if score > 0.7:
+                    df.at[index, 'CPE'] = cpe
+                    df.at[index, 'Levenshtein score'] = score
+                    updated_count += 1
+        
+        # Save the updated Excel file
+        output_path = excel_path.replace('.xlsx', '_updated.xlsx')
+        if excel_path.endswith('.xls'):
+            output_path = excel_path.replace('.xls', '_updated.xlsx')
+        
+        print(f"Saving updated Excel file to: {output_path}")
+        df.to_excel(output_path, index=False)
+        
+        print(f"Processing complete. Processed {processed_count} entries, updated {updated_count} entries.")
+        return True
     
-    check_gpu_usage()
-    
-    start_time = time.time()
-    
-    # Load or prepare CPE data
-    if os.path.exists(config.pickle_filepath) and os.path.exists(config.embeddings_filepath):
-        print("Loading existing data...")
-        cpe_items, titles, embeddings = load_cpe_data(config.pickle_filepath, config.embeddings_filepath)
-        if cpe_items is None:
-            print("Error loading data. Preparing new data...")
-            cpe_items, titles, embeddings = prepare_cpe_data(config.xml_filepath, model, device)
-            if cpe_items:
-                save_cpe_data(cpe_items, titles, embeddings, config.pickle_filepath, config.embeddings_filepath)
-    else:
-        print("Preparing CPE data...")
-        cpe_items, titles, embeddings = prepare_cpe_data(config.xml_filepath, model, device)
-        if cpe_items:
-            save_cpe_data(cpe_items, titles, embeddings, config.pickle_filepath, config.embeddings_filepath)
-    
-    processing_time = time.time() - start_time
-    print(f"Processing time: {processing_time:.2f} seconds")
-    
-    if not cpe_items or embeddings is None:
-        print("Cannot continue without valid CPE data.")
-        return
-    
-    # User interface for searching
+    except Exception as e:
+        print(f"Error processing Excel file: {e}")
+        return False
+
+def interactive_mode(cpe_items, titles, embeddings):
+    """Run the program in interactive mode."""
     while True:
         print("\n=== Search for CPE codes ===")
         vendor = input("Enter vendor name (leave empty if unknown, 'q' to quit): ")
@@ -361,6 +388,59 @@ def main():
                 print()
         else:
             print(f"No CPE codes found for '{vendor} {product} {version}'.")
+
+def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="CPE Matcher with MiniLM and Levenshtein")
+    parser.add_argument("-data", help="Path to Excel file with vendor, product, and version data", type=str, default=None)
+    args = parser.parse_args()
+
+    print("\n=== CPE Matcher with MiniLM and Levenshtein ===")
+    print(f"Using PyTorch version: {torch.__version__}")
+    if torch.cuda.is_available():
+        print(f"CUDA version: {torch.version.cuda}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        n_gpu = torch.cuda.device_count()
+        print(f"Available GPUs: {n_gpu}")
+    
+    check_gpu_usage()
+    
+    start_time = time.time()
+    
+    # Load or prepare CPE data
+    if os.path.exists(config.pickle_filepath) and os.path.exists(config.embeddings_filepath):
+        print("Loading existing data...")
+        cpe_items, titles, embeddings = load_cpe_data(config.pickle_filepath, config.embeddings_filepath)
+        if cpe_items is None:
+            print("Error loading data. Preparing new data...")
+            cpe_items, titles, embeddings = prepare_cpe_data(config.xml_filepath, model, device)
+            if cpe_items:
+                save_cpe_data(cpe_items, titles, embeddings, config.pickle_filepath, config.embeddings_filepath)
+    else:
+        print("Preparing CPE data...")
+        cpe_items, titles, embeddings = prepare_cpe_data(config.xml_filepath, model, device)
+        if cpe_items:
+            save_cpe_data(cpe_items, titles, embeddings, config.pickle_filepath, config.embeddings_filepath)
+    
+    processing_time = time.time() - start_time
+    print(f"Processing time: {processing_time:.2f} seconds")
+    
+    if not cpe_items or embeddings is None:
+        print("Cannot continue without valid CPE data.")
+        return
+    
+    # Run in Excel mode or interactive mode based on arguments
+    if args.data:
+        excel_path = args.data
+        if not os.path.exists(excel_path):
+            print(f"Error: The specified Excel file does not exist: {excel_path}")
+            return
+        
+        print(f"Running in Excel processing mode with file: {excel_path}")
+        process_excel_file(excel_path, cpe_items, titles, embeddings, model, device)
+    else:
+        print("Running in interactive mode.")
+        interactive_mode(cpe_items, titles, embeddings)
 
 if __name__ == "__main__":
     main()
