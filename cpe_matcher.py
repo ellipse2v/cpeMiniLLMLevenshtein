@@ -32,6 +32,8 @@ class Config:
     pickle_filepath = "cpe_data.pkl"                   # Path to save CPE data
     embeddings_filepath = "cpe_embeddings_minilm.npy"  # Path to save embeddings
     batch_size = 128                                   # Batch size for processing (increased because MiniLM is lighter)
+    model_path = "models/all-MiniLM-L6-v2"             # Path to locally saved model
+    model_name = "sentence-transformers/all-MiniLM-L6-v2"  # Original model name (for download if needed)
 
 config = Config()
 
@@ -47,9 +49,30 @@ def check_gpu_usage():
         return True
     return False
 
-# Load MiniLM model
+# Load or download MiniLM model
 print("Loading MiniLM model...")
-model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device=device)
+if os.path.exists(config.model_path):
+    print(f"Loading model from local path: {config.model_path}")
+    model = SentenceTransformer(config.model_path, device=device)
+else:
+    print(f"Local model not found. Downloading model: {config.model_name}")
+    print("This requires internet connection.")
+    try:
+        # Create the directory if it doesn't exist
+        os.makedirs(os.path.dirname(config.model_path), exist_ok=True)
+        
+        # Download the model
+        model = SentenceTransformer(config.model_name, device=device)
+        
+        # Save the model locally for future offline use
+        print(f"Saving model to {config.model_path} for future offline use...")
+        model.save(config.model_path)
+        print(f"Model saved successfully to {config.model_path}")
+    except Exception as e:
+        print(f"Error downloading model: {e}")
+        print("Please ensure you have internet connection for the first run.")
+        exit(1)
+
 print(f"Model loaded successfully and moved to {device}")
 check_gpu_usage()
 
@@ -330,6 +353,7 @@ def process_excel_file(excel_path, cpe_items, titles, embeddings, model, device)
                 
                 # Only update if the Levenshtein score is above 0.7
                 if score > 0.7:
+                    df['CPE'] = df['CPE'].astype(str)
                     df.at[index, 'CPE'] = cpe
                     df.at[index, 'Levenshtein score'] = score
                     updated_count += 1
@@ -349,7 +373,7 @@ def process_excel_file(excel_path, cpe_items, titles, embeddings, model, device)
         print(f"Error processing Excel file: {e}")
         return False
 
-def interactive_mode(cpe_items, titles, embeddings):
+def interactive_mode(cpe_items, titles, embeddings, model, device):
     """Run the program in interactive mode."""
     while True:
         print("\n=== Search for CPE codes ===")
@@ -395,7 +419,7 @@ def main():
     parser.add_argument("-data", help="Path to Excel file with vendor, product, and version data", type=str, default=None)
     args = parser.parse_args()
 
-    print("\n=== CPE Matcher with MiniLM and Levenshtein ===")
+    print("\n=== CPE Matcher with MiniLM and Levenshtein (Auto-download version) ===")
     print(f"Using PyTorch version: {torch.__version__}")
     if torch.cuda.is_available():
         print(f"CUDA version: {torch.version.cuda}")
@@ -440,7 +464,7 @@ def main():
         process_excel_file(excel_path, cpe_items, titles, embeddings, model, device)
     else:
         print("Running in interactive mode.")
-        interactive_mode(cpe_items, titles, embeddings)
+        interactive_mode(cpe_items, titles, embeddings, model, device)
 
 if __name__ == "__main__":
     main()
