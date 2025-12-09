@@ -27,6 +27,7 @@ import argparse
 import configparser
 import pandas as pd
 import socket
+import sys
 
 def check_internet_connection(host="8.8.8.8", port=53, timeout=3):
     """
@@ -75,58 +76,59 @@ def load_config():
 
 config = load_config()
 
-def load_model_with_fallback(device):
+def load_model_with_fallback(device, use_mini=False):
     """
     Loads a sentence transformer model with a fallback mechanism.
-    1. Tries to load the default model from the local path.
-    2. If not found, tries to download the default model from Hugging Face.
-    3. If download fails or no internet, tries to load the fallback model from the local path.
-    4. If all else fails, exits the program.
+    - If `use_mini` is True, it prioritizes the MiniLM model.
+    - Otherwise, it uses the default model.
     """
-    default_path = config['default_model_path']
-    default_name = config['default_model']
-    fallback_path = config['fallback_model_path']
-    fallback_name = config['fallback_model']
+    if use_mini:
+        print("Prioritizing MiniLM model based on --use-mini-llm flag.")
+        primary_path = config['fallback_model_path']
+        primary_name = config['fallback_model']
+        secondary_path = config['default_model_path']
+        secondary_name = config['default_model']
+    else:
+        primary_path = config['default_model_path']
+        primary_name = config['default_model']
+        secondary_path = config['fallback_model_path']
+        secondary_name = config['fallback_model']
 
-    # 1. Try to load the default model locally
-    if os.path.exists(default_path):
-        print(f"Loading default model from local path: {default_path}")
+    # 1. Try to load the primary model locally
+    if os.path.exists(primary_path):
+        print(f"Loading primary model from local path: {primary_path}")
         try:
-            return SentenceTransformer(default_path, device=device)
+            return SentenceTransformer(primary_path, device=device)
         except Exception as e:
-            print(f"Error loading default model from {default_path}: {e}")
-            # Proceed to download or fallback
+            print(f"Error loading primary model from {primary_path}: {e}")
 
     # 2. If not local, try to download it
-    print(f"Default model not found at {default_path}. Attempting to download...")
+    print(f"Primary model not found at {primary_path}. Attempting to download...")
     if check_internet_connection():
         try:
-            print(f"Downloading default model: {default_name}...")
-            # Create the directory if it doesn't exist
-            os.makedirs(os.path.dirname(default_path), exist_ok=True)
-            model = SentenceTransformer(default_name, device=device)
-            print(f"Saving model to {default_path} for future offline use...")
-            model.save(default_path)
-            print(f"Model saved successfully to {default_path}")
+            print(f"Downloading primary model: {primary_name}...")
+            os.makedirs(os.path.dirname(primary_path), exist_ok=True)
+            model = SentenceTransformer(primary_name, device=device)
+            print(f"Saving model to {primary_path} for future offline use...")
+            model.save(primary_path)
+            print(f"Model saved successfully to {primary_path}")
             return model
         except Exception as e:
-            print(f"Failed to download default model '{default_name}': {e}")
+            print(f"Failed to download primary model '{primary_name}': {e}")
     else:
-        print("No internet connection. Cannot download default model.")
+        print("No internet connection. Cannot download primary model.")
 
-    # 3. If download fails or no internet, try to load fallback model locally
-    print(f"Trying to load fallback model '{fallback_name}' from local path: {fallback_path}")
-    if os.path.exists(fallback_path):
+    # 3. If download fails, try to load the secondary model
+    print(f"Trying to load secondary model '{secondary_name}' from local path: {secondary_path}")
+    if os.path.exists(secondary_path):
         try:
-            return SentenceTransformer(fallback_path, device=device)
+            return SentenceTransformer(secondary_path, device=device)
         except Exception as e:
-            print(f"Error loading fallback model from {fallback_path}: {e}")
+            print(f"Error loading secondary model from {secondary_path}: {e}")
     
     # 4. If all else fails, error out
     print("\nFATAL: Could not load any model.")
-    print("Neither the default model nor the fallback model could be loaded.")
-    print("Please connect to the internet to allow the script to download a model,")
-    print(f"or manually place a model in '{default_path}' or '{fallback_path}'.")
+    print("Please connect to the internet to download a model or ensure one exists locally.")
     exit(1)
 
 
@@ -142,8 +144,11 @@ def check_gpu_usage():
         return True
     return False
 
+# Pre-parse for the --use-mini-llm flag before loading the model
+use_mini_llm_flag = '--use-mini-llm' in sys.argv
+
 # Load the model using the new robust logic
-model = load_model_with_fallback(device)
+model = load_model_with_fallback(device, use_mini=use_mini_llm_flag)
 print(f"Model loaded successfully and moved to {device}")
 check_gpu_usage()
 
@@ -453,7 +458,7 @@ def adjust_cpe_version(cpe_string, source_version):
             
     return ':'.join(parts)
 
-def process_excel_file(excel_path, cpe_items, titles, embeddings, model, device, product_map):
+def process_excel_file(excel_path, cpe_items, titles, embeddings, model, device, product_map, output_path=None):
     """Process an Excel file with vendor, product, and version data to find CPE codes."""
     try:
         print(f"Loading Excel file: {excel_path}")
@@ -487,9 +492,10 @@ def process_excel_file(excel_path, cpe_items, titles, embeddings, model, device,
                     df.at[index, 'CPE'] = adjusted_cpe
                     df.at[index, 'Levenshtein score'] = score
         
-        output_path = excel_path.replace('.xlsx', '_updated.xlsx')
-        if excel_path.endswith('.xls'):
-            output_path = excel_path.replace('.xls', '_updated.xlsx')
+        if not output_path:
+        # If no output path is given, create one from the input path.                                                             
+            base_path, _ = os.path.splitext(excel_path)                                          
+            output_path = f"{base_path}_updated.xlsx"
         
         print(f"Saving updated Excel file to: {output_path}")
         df.to_excel(output_path, index=False)
@@ -538,10 +544,19 @@ def interactive_mode(cpe_items, titles, embeddings, model, device, product_map):
 def main(model):
     parser = argparse.ArgumentParser(description="CPE Matcher with MiniLM and Levenshtein")
     parser.add_argument("-data", help="Path to Excel file with vendor, product, and version data", type=str, default=None)
+    parser.add_argument("-output", help="Path to Excel output file", type=str, default=None)
     parser.add_argument("--force-regenerate", help="Force regeneration of CPE data and embeddings", action="store_true")
+    parser.add_argument("--use-mini-llm", help="Use the MiniLM model instead of the default", action="store_true")
     args = parser.parse_args()
 
     print("\n=== CPE Matcher with MiniLM and Levenshtein (Auto-download version) ===")
+    
+    # Modify cache file paths if using the mini model
+    if args.use_mini_llm:
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        # Only the embeddings are model-specific. The CPE data can be shared.
+        config['embeddings_filepath'] = os.path.join(project_root, 'cpe_embeddings_minilm.npy')
+        print(f"Using MiniLM-specific embeddings file: {config['embeddings_filepath']}")
     
     start_time = time.time()
     
@@ -549,6 +564,12 @@ def main(model):
     
     # Decide whether to load or regenerate data
     should_regenerate = args.force_regenerate or not os.path.exists(config['pickle_filepath']) or not os.path.exists(config['embeddings_filepath'])
+    
+    if args.output:
+        print(f"Output will be saved to: {args.output}")
+        output_path = args.output
+    else:
+        output_path = None
 
     if not should_regenerate:
         print("Loading existing data...")
@@ -581,7 +602,7 @@ def main(model):
             return
         
         print(f"Running in Excel processing mode with file: {excel_path}")
-        process_excel_file(excel_path, cpe_items, titles, embeddings, model, device, product_map)
+        process_excel_file(excel_path, cpe_items, titles, embeddings, model, device, product_map, output_path)
     else:
         print("Running in interactive mode.")
         interactive_mode(cpe_items, titles, embeddings, model, device, product_map)

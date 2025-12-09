@@ -1,0 +1,11 @@
+torch
+sentence-transformers
+lxml
+numpy
+scikit-learn
+python-Levenshtein
+tqdm
+pandas
+requests
+cyclonedx-python-lib
+openpyxl\ncyclonedx-python-lib
