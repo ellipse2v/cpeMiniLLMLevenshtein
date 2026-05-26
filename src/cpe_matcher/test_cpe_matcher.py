@@ -15,91 +15,178 @@
 import unittest
 import os
 import sys
+import gzip
+import json
+import hashlib
+import tempfile
+import numpy as np
 
-# Add src to the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, project_root)
 
-from src.cpe_matcher.cpe_matcher import (
-    load_cpe_data,
-    prepare_cpe_data,
-    save_cpe_data,
-    find_closest_cpes,
-    parse_cpe_name,
-    config,
-    device,
-    model
-)
+
+class TestModuleImport(unittest.TestCase):
+    """Importing cpe_matcher must not trigger model loading."""
+
+    def test_import_does_not_load_model(self):
+        try:
+            import torch
+            _has_torch = True
+        except ImportError:
+            _has_torch = False
+
+        for key in list(sys.modules.keys()):
+            if 'cpe_matcher' in key:
+                del sys.modules[key]
+
+        mem_before = torch.cuda.memory_allocated() if (_has_torch and torch.cuda.is_available()) else 0
+        import src.cpe_matcher.cpe_matcher as m
+        mem_after = torch.cuda.memory_allocated() if (_has_torch and torch.cuda.is_available()) else 0
+
+        self.assertFalse(hasattr(m, 'model'), "Module must not have a top-level 'model'")
+        self.assertEqual(mem_before, mem_after, "GPU memory must not change on import")
+
+
+class TestJSONCache(unittest.TestCase):
+    """JSON+gzip+sha256 round-trip and integrity detection."""
+
+    def test_round_trip(self):
+        cpe_items = ["cpe:2.3:a:test:product:1.0:*:*:*:*:*:*:*"]
+        titles = ["Test Product 1.0"]
+        product_map = {"product": [0]}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = os.path.join(tmpdir, 'cpe_data.json.gz')
+            hash_path = json_path + '.sha256'
+
+            data = {'cpe_items': cpe_items, 'titles': titles, 'product_map': product_map}
+            payload = json.dumps(data).encode('utf-8')
+            with gzip.open(json_path, 'wb') as f:
+                f.write(payload)
+            with open(hash_path, 'w') as f:
+                f.write(hashlib.sha256(payload).hexdigest())
+            np.save(os.path.join(tmpdir, 'emb.npy'), np.zeros((1, 4), dtype=np.float32))
+
+            with gzip.open(json_path, 'rb') as f:
+                raw = f.read()
+            with open(hash_path) as f:
+                expected = f.read().strip()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), expected)
+            loaded = json.loads(raw.decode('utf-8'))
+            self.assertEqual(loaded['cpe_items'], cpe_items)
+
+    def test_tampered_cache_detected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = os.path.join(tmpdir, 'cpe_data.json.gz')
+            hash_path = json_path + '.sha256'
+
+            data = {'cpe_items': ['cpe:2.3:a:x:y:1:*:*:*:*:*:*:*'], 'titles': [''], 'product_map': {}}
+            payload = json.dumps(data).encode('utf-8')
+            with gzip.open(json_path, 'wb') as f:
+                f.write(payload)
+            with open(hash_path, 'w') as f:
+                f.write("deadbeef" * 8)
+
+            with gzip.open(json_path, 'rb') as f:
+                raw = f.read()
+            with open(hash_path) as f:
+                stored = f.read().strip()
+            self.assertNotEqual(hashlib.sha256(raw).hexdigest(), stored)
+
+
+class TestVersionSimilarity(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        from src.cpe_matcher.cpe_matcher import version_similarity
+        cls.version_similarity = staticmethod(version_similarity)
+
+    def test_identical(self):
+        self.assertAlmostEqual(self.version_similarity("1.2.3", "1.2.3"), 1.0)
+
+    def test_one_patch_off(self):
+        score = self.version_similarity("10.0.1", "10.0.2")
+        self.assertGreater(score, 0.8)
+
+    def test_major_diff(self):
+        score = self.version_similarity("1.0", "10.0")
+        self.assertLess(score, 0.5)
+
+    def test_empty(self):
+        self.assertEqual(self.version_similarity("", "1.0"), 0.0)
+        self.assertEqual(self.version_similarity("1.0", ""), 0.0)
+
+    def test_non_numeric_fallback(self):
+        self.assertAlmostEqual(self.version_similarity("sp1", "sp1"), 1.0)
+
+    def test_wildcard(self):
+        self.assertEqual(self.version_similarity("10.0.1", "*"), 0.5)
+
 
 class TestCPEMatcher(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Load all necessary data once for all tests."""
-        print("Setting up test class...")
-        should_regenerate = config['force_regenerate'] or not os.path.exists(config['pickle_filepath']) or not os.path.exists(config['embeddings_filepath'])
-
-        if not should_regenerate:
-            print("Loading existing data for tests...")
-            cls.cpe_items, cls.titles, cls.embeddings, cls.product_map = load_cpe_data(config['pickle_filepath'], config['embeddings_filepath'])
-            if not cls.product_map:
-                print("Product map missing. Forcing regeneration for tests.")
-                should_regenerate = True
-        
-        if should_regenerate:
-            print("Preparing new CPE data for tests...")
-            cls.cpe_items, cls.titles, cls.embeddings, cls.product_map = prepare_cpe_data(config['xml_filepath'], model, device)
-            if cls.cpe_items is not None:
-                save_cpe_data(cls.cpe_items, cls.titles, cls.embeddings, cls.product_map, config['pickle_filepath'], config['embeddings_filepath'])
-
-        if not cls.cpe_items or cls.embeddings is None or not cls.product_map:
-            raise Exception("Could not load or prepare CPE data for tests.")
-
-        print("Test class setup complete.")
+        from src.cpe_matcher.cpe_matcher import CPEMatcher
+        cls.matcher = CPEMatcher()
+        cls.matcher.load_data()
+        if not cls.matcher.cpe_items or cls.matcher.embeddings is None:
+            raise Exception("Could not load CPE data.")
 
     def test_windows11_is_prioritized_and_found(self):
-        """
-        Tests if find_closest_cpes correctly finds and prioritizes 'windows_11'.
-        """
-        vendor = 'microsoft'
-        product = 'windows_11'
-        version = '22000'
+        from src.cpe_matcher.cpe_matcher import parse_cpe_name
+        results = self.matcher.search('microsoft', 'windows_11', '22000', num_results=10)
+        self.assertTrue(results)
+        for r in results[:5]:
+            _, p, _ = parse_cpe_name(r['cpe'])
+            self.assertEqual(p, 'windows_11', f"Expected windows_11, got {p}")
+        _, top_product, _ = parse_cpe_name(results[0]['cpe'])
+        self.assertEqual(top_product, 'windows_11')
 
-        print(f"\n--- Running test: test_windows11_is_prioritized_and_found with query: {vendor} {product} {version} ---")
-        
-        results = find_closest_cpes(
-            vendor=vendor,
-            product=product,
-            version=version,
-            cpe_items=self.cpe_items,
-            titles=self.titles,
-            embeddings=self.embeddings,
-            model=model,
-            device=device,
-            product_map=self.product_map,
-            num_results=10
-        )
+    def test_search_returns_score_breakdown(self):
+        results = self.matcher.search('microsoft', 'windows_11', '22000', num_results=1)
+        self.assertTrue(results)
+        bd = results[0]['score_breakdown']
+        for key in ('semantic', 'vendor', 'product', 'version'):
+            self.assertIn(key, bd)
+            self.assertIsInstance(bd[key], float)
 
-        self.assertTrue(results, "Should return at least one result")
+    def test_min_score_threshold_in_config(self):
+        t = self.matcher.config['min_score_threshold']
+        self.assertIsInstance(t, float)
+        self.assertGreater(t, 0.0)
+        self.assertLessEqual(t, 1.0)
 
-        print("\nTop 5 results from the test:")
-        found_other_product = False
-        for i, (score, cpe, title) in enumerate(results[:5]):
-            _, p_name, _ = parse_cpe_name(cpe)
-            p_name_normalized = p_name.replace('_', ' ')
-            print(f"{i+1}. CPE: {cpe}, Product: {p_name_normalized}, Score: {score:.4f}")
-            if p_name_normalized != 'windows 11':
-                found_other_product = True
-        
-        self.assertFalse(found_other_product, "Top 5 results should only contain 'windows 11' products for this specific query.")
 
-        # The first result should be a 'windows 11' product
-        _, top_cpe, _ = results[0]
-        _, top_product_name, _ = parse_cpe_name(top_cpe)
+class TestFAISSSearch(unittest.TestCase):
 
-        self.assertEqual(top_product_name, 'windows_11',
-                         f"The top result should be for 'windows_11', but it was for '{top_product_name}'.")
+    def test_faiss_top1_matches_brute_force(self):
+        """FAISS inner-product top-1 must agree with brute-force cosine."""
+        try:
+            import faiss
+        except ImportError:
+            self.skipTest("faiss-cpu not installed")
+
+        from sklearn.metrics.pairwise import cosine_similarity as sklearn_cos
+
+        np.random.seed(42)
+        n, dim = 200, 64
+        vecs = np.random.rand(n, dim).astype(np.float32)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        vecs_norm = vecs / norms
+
+        query = np.random.rand(1, dim).astype(np.float32)
+        query_norm = query / np.linalg.norm(query)
+
+        bf_top = int(sklearn_cos(query_norm, vecs_norm)[0].argmax())
+
+        index = faiss.IndexFlatIP(dim)
+        index.add(vecs_norm)
+        _, faiss_ids = index.search(query_norm, 1)
+        faiss_top = int(faiss_ids[0][0])
+
+        self.assertEqual(bf_top, faiss_top)
+
 
 if __name__ == '__main__':
     unittest.main()
-

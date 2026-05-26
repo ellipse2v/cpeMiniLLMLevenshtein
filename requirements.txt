@@ -8,4 +8,5 @@ tqdm
 pandas
 requests
 cyclonedx-python-lib
-openpyxl\ncyclonedx-python-lib
+openpyxl
+faiss-cpu

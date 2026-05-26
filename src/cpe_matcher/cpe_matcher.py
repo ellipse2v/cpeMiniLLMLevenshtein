@@ -11,152 +11,54 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# 
+
 import os
-import pickle
+import gzip
+import json
+import hashlib
 import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer
-import lxml.etree as ET
-from sklearn.metrics.pairwise import cosine_similarity
-from tqdm import tqdm
 import re
-import Levenshtein
+import socket
+import sys
 import time
 import argparse
 import configparser
-import pandas as pd
-import socket
-import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import Levenshtein
+
+try:
+    import torch
+    from sentence_transformers import SentenceTransformer
+    import lxml.etree as ET
+    from sklearn.metrics.pairwise import cosine_similarity
+    from tqdm import tqdm
+    import pandas as pd
+    _ML_AVAILABLE = True
+except ImportError:
+    _ML_AVAILABLE = False
+
+try:
+    import faiss
+    _FAISS_AVAILABLE = True
+except ImportError:
+    _FAISS_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Pure helper functions — no side effects, safe to import
+# ---------------------------------------------------------------------------
 
 def check_internet_connection(host="8.8.8.8", port=53, timeout=3):
-    """
-    Check for internet connection by trying to connect to a well-known host.
-    Host: Google's primary DNS server.
-    Port: DNS port.
-    """
     try:
         socket.setdefaulttimeout(timeout)
         socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
         return True
-    except socket.error as ex:
-        print(f"Internet connection check failed: {ex}")
+    except socket.error:
         return False
 
-def load_config():
-    """Loads configuration from config.ini and resolves paths."""
-    config = configparser.ConfigParser()
-    script_dir = os.path.dirname(__file__)
-    config_path = os.path.join(script_dir, 'config.ini')
-    
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
-    config.read(config_path)
-    
-    # Resolve paths relative to the project root (which is two levels up from the script)
-    project_root = os.path.abspath(os.path.join(script_dir, '..', '..'))
-    
-    cfg = {
-        'default_model': config.get('Models', 'DEFAULT_MODEL'),
-        'fallback_model': config.get('Models', 'FALLBACK_MODEL'),
-        'default_model_path': os.path.join(project_root, config.get('Paths', 'DEFAULT_MODEL_PATH')),
-        'fallback_model_path': os.path.join(project_root, config.get('Paths', 'FALLBACK_MODEL_PATH')),
-        'pickle_filepath': os.path.join(project_root, config.get('Paths', 'CPE_DATA_PICKLE')),
-        'embeddings_filepath': os.path.join(project_root, config.get('Paths', 'CPE_EMBEDDINGS_NUMPY')),
-        'xml_filepath': os.path.join(project_root, config.get('Paths', 'CPE_DICTIONARY_XML')),
-        'batch_size': config.getint('Settings', 'BATCH_SIZE'),
-        'num_results': config.getint('Settings', 'NUM_RESULTS'),
-        'force_regenerate': config.getboolean('Settings', 'FORCE_REGENERATE'),
-        'semantic_weight': config.getfloat('Settings', 'SEMANTIC_SCORE_WEIGHT'),
-        'vendor_weight': config.getfloat('Settings', 'VENDOR_SCORE_WEIGHT'),
-        'product_weight': config.getfloat('Settings', 'PRODUCT_SCORE_WEIGHT'),
-        'version_weight': config.getfloat('Settings', 'VERSION_SCORE_WEIGHT'),
-    }
-    return cfg
-
-config = load_config()
-
-def load_model_with_fallback(device, use_mini=False):
-    """
-    Loads a sentence transformer model with a fallback mechanism.
-    - If `use_mini` is True, it prioritizes the MiniLM model.
-    - Otherwise, it uses the default model.
-    """
-    if use_mini:
-        print("Prioritizing MiniLM model based on --use-mini-llm flag.")
-        primary_path = config['fallback_model_path']
-        primary_name = config['fallback_model']
-        secondary_path = config['default_model_path']
-        secondary_name = config['default_model']
-    else:
-        primary_path = config['default_model_path']
-        primary_name = config['default_model']
-        secondary_path = config['fallback_model_path']
-        secondary_name = config['fallback_model']
-
-    # 1. Try to load the primary model locally
-    if os.path.exists(primary_path):
-        print(f"Loading primary model from local path: {primary_path}")
-        try:
-            return SentenceTransformer(primary_path, device=device)
-        except Exception as e:
-            print(f"Error loading primary model from {primary_path}: {e}")
-
-    # 2. If not local, try to download it
-    print(f"Primary model not found at {primary_path}. Attempting to download...")
-    if check_internet_connection():
-        try:
-            print(f"Downloading primary model: {primary_name}...")
-            os.makedirs(os.path.dirname(primary_path), exist_ok=True)
-            model = SentenceTransformer(primary_name, device=device)
-            print(f"Saving model to {primary_path} for future offline use...")
-            model.save(primary_path)
-            print(f"Model saved successfully to {primary_path}")
-            return model
-        except Exception as e:
-            print(f"Failed to download primary model '{primary_name}': {e}")
-    else:
-        print("No internet connection. Cannot download primary model.")
-
-    # 3. If download fails, try to load the secondary model
-    print(f"Trying to load secondary model '{secondary_name}' from local path: {secondary_path}")
-    if os.path.exists(secondary_path):
-        try:
-            return SentenceTransformer(secondary_path, device=device)
-        except Exception as e:
-            print(f"Error loading secondary model from {secondary_path}: {e}")
-    
-    # 4. If all else fails, error out
-    print("\nFATAL: Could not load any model.")
-    print("Please connect to the internet to download a model or ensure one exists locally.")
-    exit(1)
-
-
-# Check GPU availability
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-# Function to check GPU usage
-def check_gpu_usage():
-    if torch.cuda.is_available():
-        print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
-        print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-        return True
-    return False
-
-# Pre-parse for the --use-mini-llm flag before loading the model
-use_mini_llm_flag = '--use-mini-llm' in sys.argv
-
-# Load the model using the new robust logic
-model = load_model_with_fallback(device, use_mini=use_mini_llm_flag)
-print(f"Model loaded successfully and moved to {device}")
-check_gpu_usage()
 
 def parse_cpe_name(cpe_string):
-    """
-    Extract vendor, product, and version from a CPE string.
-    CPE 2.3 format: cpe:2.3:part:vendor:product:version:update:edition:language:sw_edition:target_sw:target_hw:other
-    """
+    """Return (vendor, product, version) from a CPE 2.3 string."""
     parts = cpe_string.split(':')
     if len(parts) >= 5:
         vendor = parts[3] if parts[3] != '*' else ""
@@ -165,447 +67,567 @@ def parse_cpe_name(cpe_string):
         return vendor, product, version
     return "", "", ""
 
-def load_cpe_xml(filepath):
-    """Load the CPE XML file and return the root of the XML tree."""
-    abs_path = os.path.abspath(filepath)
-    print(f"Attempting to load CPE dictionary from: {abs_path}")
-    if not os.path.exists(abs_path):
-        print(f"Error: File does not exist at the specified path: {abs_path}")
-        return None
-    try:
-        tree = ET.parse(filepath)
-        return tree.getroot()
-    except Exception as e:
-        print(f"Error loading or parsing XML file: {e}")
-        return None
-
-def extract_cpe_items(root):
-    """Extract CPE items from the XML root."""
-    namespace = {
-        'cpe': 'http://cpe.mitre.org/dictionary/2.0',
-        'cpe-23': 'http://scap.nist.gov/schema/cpe-extension/2.3'
-    }
-    
-    cpe_items = []
-    titles = []
-    
-    for cpe_item in root.findall(".//cpe:cpe-item", namespaces=namespace):
-        cpe23_item = cpe_item.find(".//cpe-23:cpe23-item", namespaces=namespace)
-        if cpe23_item is not None and cpe23_item.get("name"):
-            cpe_name = cpe23_item.get("name")
-            
-            # Extract title if it exists
-            title_element = cpe_item.find(".//cpe:title", namespaces=namespace)
-            title = title_element.text if title_element is not None else ""
-            
-            cpe_items.append(cpe_name)
-            titles.append(title)
-    
-    return cpe_items, titles
 
 def clean_text(text):
-    """Clean text for processing."""
     if not text:
         return ""
-    # Replace special characters with spaces
     text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
-    # Remove multiple spaces
     text = re.sub(r'\s+', ' ', text).strip()
-    # Convert to lowercase
     return text.lower()
 
-def create_embeddings(texts, model, device, batch_size=128):
-    """Create embeddings for a list of texts."""
-    embedding_dim = model.get_sentence_embedding_dimension()
-    embeddings = np.zeros((len(texts), embedding_dim), dtype=np.float32)
-    
-    # Check GPU usage before processing
-    print("GPU status before embedding generation:")
-    check_gpu_usage()
-    
-    # Process in batches to save memory
-    with tqdm(total=len(texts), desc="Generating embeddings") as pbar:
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            
-            # Force synchronization to free GPU memory
-            if i > 0 and i % (batch_size * 10) == 0:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                print(f"Progress: {i}/{len(texts)} texts processed")
-                check_gpu_usage()
-            
-            try:
-                # Generate embeddings with SentenceTransformer
-                batch_embeddings = model.encode(batch_texts, convert_to_numpy=True)
-                
-                # Store in the main numpy array
-                end_idx = min(i + batch_size, len(texts))
-                embeddings[i:end_idx] = batch_embeddings
-                
-            except Exception as e:
-                print(f"Error processing batch {i}: {e}")
-                # Continue with the next batch
-            
-            # Update progress bar
-            pbar.update(len(batch_texts))
-    
-    # Check GPU usage after processing
-    print("GPU status after embedding generation:")
-    check_gpu_usage()
-    
-    return embeddings
 
 def levenshtein_similarity(str1, str2):
-    """Calculate similarity based on Levenshtein distance."""
     if not str1 or not str2:
         return 0.0
-    
     distance = Levenshtein.distance(str1.lower(), str2.lower())
     max_len = max(len(str1), len(str2))
-    
     if max_len == 0:
-        return 1.0  # Two empty strings are identical
-    
-    # Convert distance to similarity (0 to 1 where 1 is identical)
+        return 1.0
     return 1.0 - (distance / max_len)
 
-def prepare_cpe_data(xml_filepath, model, device):
-    """Prepare CPE data, generate embeddings, and create a product map."""
-    root = load_cpe_xml(xml_filepath)
-    if root is None:
-        return None, None, None, None
 
-    print("Extracting CPE items...")
-    cpe_items, titles = extract_cpe_items(root)
-    print(f"Number of extracted CPE items: {len(cpe_items)}")
+def version_similarity(v1, v2):
+    """
+    Numeric-aware version comparison.
+    Parses X.Y.Z components and weighs major differences more heavily.
+    Falls back to Levenshtein for non-numeric strings.
+    Returns 0.5 for wildcard '*' (no version info, neutral score).
+    """
+    if not v1 or not v2:
+        return 0.0
+    if v1 == '*' or v2 == '*':
+        return 0.5
 
-    # Create a map from normalized product name to list of indices
-    product_map = {}
-    print("Creating product to index map...")
-    for i, cpe_string in enumerate(tqdm(cpe_items, desc="Mapping products")):
-        _, product, _ = parse_cpe_name(cpe_string)
-        if product:
-            normalized_product = product.lower().replace('_', ' ')
-            if normalized_product not in product_map:
-                product_map[normalized_product] = []
-            product_map[normalized_product].append(i)
+    def _parse(v):
+        parts = v.strip().split('.')
+        result = []
+        for p in parts:
+            try:
+                result.append(int(p))
+            except ValueError:
+                return None
+        return result
 
-    # Prepare texts for embeddings
-    print("Preparing texts for embeddings...")
-    texts = []
-    for cpe, title in zip(cpe_items, titles):
-        vendor, product, version = parse_cpe_name(cpe)
-        vendor_clean = clean_text(vendor.replace('_', ' '))
-        product_clean = clean_text(product.replace('_', ' '))
-        version_clean = clean_text(version.replace('_', ' '))
-        
-        text = f"{vendor_clean} {product_clean}"
-        if version_clean:
-            text += f" {version_clean}"
-        if title:
-            text += f" {clean_text(title)}"
-        texts.append(text.strip())
+    p1, p2 = _parse(v1), _parse(v2)
+    if p1 is None or p2 is None:
+        return levenshtein_similarity(v1, v2)
 
-    print("Generating embeddings...")
-    embeddings = create_embeddings(texts, model, device, batch_size=config['batch_size'])
-    
-    return cpe_items, titles, embeddings, product_map
+    max_len = max(len(p1), len(p2))
+    p1 += [0] * (max_len - len(p1))
+    p2 += [0] * (max_len - len(p2))
 
-def save_cpe_data(cpe_items, titles, embeddings, product_map, pickle_filepath, embeddings_filepath):
-    """Save CPE data, embeddings, and product map."""
-    try:
-        print(f"Saving CPE data to {pickle_filepath}...")
-        with open(pickle_filepath, 'wb') as f:
-            pickle.dump({'cpe_items': cpe_items, 'titles': titles, 'product_map': product_map}, f)
-        
-        print(f"Saving embeddings to {embeddings_filepath}...")
-        np.save(embeddings_filepath, embeddings)
-        
-        print("Save completed successfully.")
-        return True
-    except Exception as e:
-        print(f"Error saving data: {e}")
-        return False
+    total_weight = 0.0
+    total_score = 0.0
+    for i, (a, b) in enumerate(zip(p1, p2)):
+        weight = 1.0 / (2 ** i)
+        max_val = max(a, b, 1)
+        total_score += (1.0 - abs(a - b) / max_val) * weight
+        total_weight += weight
 
-def load_cpe_data(pickle_filepath, embeddings_filepath):
-    """Load CPE data, embeddings, and product map."""
-    try:
-        print(f"Loading data from {pickle_filepath}...")
-        with open(pickle_filepath, 'rb') as f:
-            data = pickle.load(f)
-        
-        cpe_items = data.get('cpe_items', [])
-        titles = data.get('titles', [])
-        product_map = data.get('product_map', {})
-        
-        print(f"Loading embeddings from {embeddings_filepath}...")
-        embeddings = np.load(embeddings_filepath)
-        
-        print(f"CPE data loaded: {len(cpe_items)} items")
-        print(f"Embeddings loaded: {embeddings.shape}")
-        if not product_map:
-            print("Warning: Product map not found or is empty in pickle file.")
+    return total_score / total_weight
 
-        return cpe_items, titles, embeddings, product_map
-    except Exception as e:
-        print(f"Error loading data: {e}")
-        return None, None, None, None
-
-def find_closest_cpes(vendor, product, version, cpe_items, titles, embeddings, model, device, product_map, num_results=5):
-    """Find the closest CPE codes using a hybrid search approach."""
-    # Build the query
-    query = ""
-    if vendor:
-        query += clean_text(vendor) + " "
-    if product:
-        query += clean_text(product) + " "
-    if version:
-        query += clean_text(version)
-    query = query.strip()
-    
-    if not query:
-        return []
-
-    print("Generating embedding for the query...")
-    query_embedding = model.encode([query], convert_to_numpy=True)
-    
-    print("Computing similarities...")
-    similarities = cosine_similarity(query_embedding, embeddings)[0]
-
-    # --- Hybrid Candidate Selection ---
-    # 1. Get indices of exact product matches from the pre-computed map
-    exact_match_indices = set()
-    if product:
-        normalized_query_product = product.lower().replace('_', ' ')
-        exact_match_indices = set(product_map.get(normalized_query_product, []))
-
-    # 2. Get top semantic matches
-    top_semantic_indices = set(similarities.argsort()[-num_results*20:][::-1])
-
-    # 3. Combine them to form the candidate pool
-    combined_indices = exact_match_indices.union(top_semantic_indices)
-    
-    print(f"Preparing results from a pool of {len(combined_indices)} candidates...")
-    results = []
-    for idx in combined_indices:
-        cpe = cpe_items[idx]
-        title = titles[idx] if idx < len(titles) else ""
-        cpe_vendor, cpe_product, cpe_version = parse_cpe_name(cpe)
-
-        is_exact_product_match = product.lower().replace('_', ' ') == cpe_product.lower().replace('_', ' ') if product and cpe_product else False
-        
-        vendor_score = levenshtein_similarity(vendor, cpe_vendor.replace('_', ' ')) if vendor and cpe_vendor else 0.5
-        product_score = levenshtein_similarity(product, cpe_product.replace('_', ' ')) if product and cpe_product else 0.0
-        version_score = levenshtein_similarity(version, cpe_version.replace('_', ' ')) if version and cpe_version else 0.5
-        
-        semantic_score = similarities[idx]
-        combined_score = (semantic_score * config['semantic_weight']) + \
-                         (vendor_score * config['vendor_weight']) + \
-                         (product_score * config['product_weight']) + \
-                         (version_score * config['version_weight'])
-        
-        results.append((combined_score, cpe, title, is_exact_product_match))
-    
-    results.sort(key=lambda x: (x[3], x[0]), reverse=True)
-    
-    # Deduplicate results to show only one architecture per CPE
-    final_results = deduplicate_results(results)
-    
-    return [(score, cpe, title) for score, cpe, title, _ in final_results[:num_results]]
 
 def get_canonical_cpe(cpe_string):
-    """
-    Creates a canonical representation of a CPE string by taking only the first 10 parts
-    (up to sw_edition), effectively ignoring target_sw, target_hw, and other.
-    """
-    parts = cpe_string.split(':')
-    # Take up to the 10th part (index 9), which is sw_edition
-    canonical_parts = parts[:10]
-    return ':'.join(canonical_parts)
+    """Strip architecture-specific suffixes for deduplication (keep first 10 components)."""
+    return ':'.join(cpe_string.split(':')[:10])
 
-def deduplicate_results(results):
-    """
-    Deduplicates a list of CPE results, keeping only the highest-scoring one
-    for each unique CPE (ignoring architecture).
-    """
-    deduplicated = []
-    seen_canonical_cpes = set()
-    
-    for result in results:
-        _, cpe, _, _ = result
-        canonical_cpe = get_canonical_cpe(cpe)
-        
-        if canonical_cpe not in seen_canonical_cpes:
-            deduplicated.append(result)
-            seen_canonical_cpes.add(canonical_cpe)
-            
-    return deduplicated
 
 def adjust_cpe_version(cpe_string, source_version):
-    """
-    Adjusts the version of a CPE string based on the source version from the input file.
-    - If source_version is provided, it replaces the version in the CPE string.
-    - If source_version is empty, the version in the CPE string is replaced with a wildcard '*'.
-    """
+    """Replace the version component of a CPE string with source_version, or '*' if empty."""
     parts = cpe_string.split(':')
-    
     if len(parts) > 5:
         if source_version and str(source_version).strip():
             parts[5] = str(source_version).strip().lower().replace(' ', '_')
         else:
             parts[5] = '*'
-            
     return ':'.join(parts)
 
-def process_excel_file(excel_path, cpe_items, titles, embeddings, model, device, product_map, output_path=None):
-    """Process an Excel file with vendor, product, and version data to find CPE codes."""
-    try:
-        print(f"Loading Excel file: {excel_path}")
-        df = pd.read_excel(excel_path)
-        
-        required_columns = ['Vendor', 'Product', 'Version', 'CPE', 'Levenshtein score']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        
-        if missing_columns:
-            print(f"Error: Missing required columns: {', '.join(missing_columns)}")
-            return False
-        
-        total_rows = len(df)
-        print(f"Processing {total_rows} entries...")
-        
-        for index, row in tqdm(df.iterrows(), total=total_rows, desc="Processing Excel data"):
-            vendor = str(row['Vendor']) if not pd.isna(row['Vendor']) else ""
-            product = str(row['Product']) if not pd.isna(row['Product']) else ""
-            source_version = str(row['Version']) if not pd.isna(row['Version']) else ""
-            
-            if not product:
-                continue
-            
-            results = find_closest_cpes(vendor, product, source_version, cpe_items, titles, embeddings, model, device, product_map, num_results=1)
-            
-            if results:
-                score, original_cpe, _ = results[0]
-                if score > 0.7:
-                    adjusted_cpe = adjust_cpe_version(original_cpe, source_version)
-                    df['CPE'] = df['CPE'].astype(str)
-                    df.at[index, 'CPE'] = adjusted_cpe
-                    df.at[index, 'Levenshtein score'] = score
-        
-        if not output_path:
-        # If no output path is given, create one from the input path.                                                             
-            base_path, _ = os.path.splitext(excel_path)                                          
-            output_path = f"{base_path}_updated.xlsx"
-        
-        print(f"Saving updated Excel file to: {output_path}")
-        df.to_excel(output_path, index=False)
-        
-        return True
-    
-    except Exception as e:
-        print(f"Error processing Excel file: {e}")
-        return False
 
-def interactive_mode(cpe_items, titles, embeddings, model, device, product_map):
-    """Run the program in interactive mode."""
+# ---------------------------------------------------------------------------
+# CPEMatcher class
+# ---------------------------------------------------------------------------
+
+class CPEMatcher:
+    """
+    Encapsulates CPE matching: config, model, embeddings, search, and batch processing.
+    Instantiate once; call load_data() before search() or process_excel().
+    """
+
+    def __init__(self, config_path=None, use_mini=False):
+        self.config = self._load_config(config_path)
+        self.use_mini = use_mini
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+        _t = time.time()
+        self.model = self._load_model_with_fallback()
+        print(f"Model loaded on {self.device} ({time.time()-_t:.2f}s)")
+        if torch.cuda.is_available():
+            print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+
+        self.cpe_items = None
+        self.titles = None
+        self.embeddings = None
+        self.product_map = None
+        self._faiss_index = None
+        self._embeddings_normalized = None
+
+    def _load_config(self, config_path=None):
+        config = configparser.ConfigParser()
+        if config_path is None:
+            config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config not found: {config_path}")
+        config.read(config_path)
+
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        return {
+            'default_model': config.get('Models', 'DEFAULT_MODEL'),
+            'fallback_model': config.get('Models', 'FALLBACK_MODEL'),
+            'default_model_path': os.path.join(project_root, config.get('Paths', 'DEFAULT_MODEL_PATH')),
+            'fallback_model_path': os.path.join(project_root, config.get('Paths', 'FALLBACK_MODEL_PATH')),
+            'json_filepath': os.path.join(project_root, config.get('Paths', 'CPE_DATA_JSON', fallback='cpe_data.json.gz')),
+            'embeddings_filepath': os.path.join(project_root, config.get('Paths', 'CPE_EMBEDDINGS_NUMPY')),
+            'xml_filepath': os.path.join(project_root, config.get('Paths', 'CPE_DICTIONARY_XML')),
+            'batch_size': config.getint('Settings', 'BATCH_SIZE'),
+            'num_results': config.getint('Settings', 'NUM_RESULTS'),
+            'force_regenerate': config.getboolean('Settings', 'FORCE_REGENERATE'),
+            'semantic_weight': config.getfloat('Settings', 'SEMANTIC_SCORE_WEIGHT'),
+            'vendor_weight': config.getfloat('Settings', 'VENDOR_SCORE_WEIGHT'),
+            'product_weight': config.getfloat('Settings', 'PRODUCT_SCORE_WEIGHT'),
+            'version_weight': config.getfloat('Settings', 'VERSION_SCORE_WEIGHT'),
+            'min_score_threshold': config.getfloat('Settings', 'MIN_SCORE_THRESHOLD', fallback=0.7),
+            'max_workers': config.getint('Settings', 'MAX_WORKERS', fallback=1),
+            'faiss_min_rows': config.getint('Settings', 'FAISS_MIN_ROWS', fallback=100),
+        }
+
+    def _load_model_with_fallback(self):
+        if self.use_mini:
+            primary_path = self.config['fallback_model_path']
+            primary_name = self.config['fallback_model']
+            secondary_path = self.config['default_model_path']
+            secondary_name = self.config['default_model']
+        else:
+            primary_path = self.config['default_model_path']
+            primary_name = self.config['default_model']
+            secondary_path = self.config['fallback_model_path']
+            secondary_name = self.config['fallback_model']
+
+        if os.path.exists(primary_path):
+            print(f"Loading model from {primary_path}")
+            try:
+                return SentenceTransformer(primary_path, device=self.device)
+            except Exception as e:
+                print(f"Error loading primary model: {e}")
+
+        print(f"Downloading {primary_name}...")
+        if check_internet_connection():
+            try:
+                os.makedirs(os.path.dirname(primary_path), exist_ok=True)
+                model = SentenceTransformer(primary_name, device=self.device)
+                model.save(primary_path)
+                return model
+            except Exception as e:
+                print(f"Download failed: {e}")
+        else:
+            print("No internet connection.")
+
+        if os.path.exists(secondary_path):
+            try:
+                return SentenceTransformer(secondary_path, device=self.device)
+            except Exception as e:
+                print(f"Error loading fallback model: {e}")
+
+        print("FATAL: Could not load any model.")
+        sys.exit(1)
+
+    def load_data(self, force_regenerate=False):
+        """Load or generate CPE data and embeddings. Must be called before search()."""
+        _t_total = time.time()
+        cfg = self.config
+        if self.use_mini:
+            cfg = dict(cfg)
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+            cfg['embeddings_filepath'] = os.path.join(project_root, 'cpe_embeddings_minilm.npy')
+            self.config = cfg
+
+        should_regenerate = (
+            force_regenerate
+            or cfg['force_regenerate']
+            or not os.path.exists(cfg['json_filepath'])
+            or not os.path.exists(cfg['embeddings_filepath'])
+        )
+
+        if not should_regenerate:
+            self.cpe_items, self.titles, self.embeddings, self.product_map = self._load_cpe_data()
+            if not self.product_map:
+                print("Product map missing. Forcing regeneration.")
+                should_regenerate = True
+
+        if should_regenerate:
+            self.cpe_items, self.titles, self.embeddings, self.product_map = self._prepare_cpe_data()
+            if self.cpe_items is not None:
+                self._save_cpe_data()
+
+        print(f"Total startup time: {time.time()-_t_total:.2f}s")
+
+    def _load_cpe_data(self):
+        cfg = self.config
+        json_path = cfg['json_filepath']
+        hash_path = json_path + '.sha256'
+        try:
+            _t = time.time()
+            print(f"Loading CPE data from {json_path}...")
+            with gzip.open(json_path, 'rb') as f:
+                raw = f.read()
+
+            if os.path.exists(hash_path):
+                with open(hash_path) as f:
+                    expected = f.read().strip()
+                if hashlib.sha256(raw).hexdigest() != expected:
+                    print("WARNING: Cache integrity check failed. Forcing regeneration.")
+                    return None, None, None, None
+
+            data = json.loads(raw.decode('utf-8'))
+            cpe_items = data.get('cpe_items', [])
+            titles = data.get('titles', [])
+            product_map = data.get('product_map', {})
+            print(f"  JSON: {len(cpe_items)} items in {time.time()-_t:.2f}s")
+
+            _t = time.time()
+            print(f"Loading embeddings from {cfg['embeddings_filepath']}...")
+            embeddings = np.load(cfg['embeddings_filepath'], mmap_mode='r')
+            print(f"  Embeddings: {embeddings.shape} mapped in {time.time()-_t:.2f}s")
+            return cpe_items, titles, embeddings, product_map
+        except Exception as e:
+            print(f"Error loading data: {e}")
+            return None, None, None, None
+
+    def _save_cpe_data(self):
+        cfg = self.config
+        json_path = cfg['json_filepath']
+        hash_path = json_path + '.sha256'
+        try:
+            data = {
+                'cpe_items': self.cpe_items,
+                'titles': self.titles,
+                'product_map': self.product_map,
+            }
+            payload = json.dumps(data).encode('utf-8')
+            with gzip.open(json_path, 'wb') as f:
+                f.write(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            with open(hash_path, 'w') as f:
+                f.write(digest)
+            np.save(cfg['embeddings_filepath'], self.embeddings)
+            print(f"Data saved ({json_path}, sha256: {digest[:12]}...)")
+        except Exception as e:
+            print(f"Error saving data: {e}")
+
+    def _prepare_cpe_data(self):
+        cfg = self.config
+        root = self._load_cpe_xml(cfg['xml_filepath'])
+        if root is None:
+            return None, None, None, None
+
+        print("Extracting CPE items...")
+        cpe_items, titles = self._extract_cpe_items(root)
+        print(f"Extracted {len(cpe_items)} items.")
+
+        product_map = {}
+        for i, cpe_string in enumerate(tqdm(cpe_items, desc="Mapping products")):
+            _, product, _ = parse_cpe_name(cpe_string)
+            if product:
+                key = product.lower().replace('_', ' ')
+                if key not in product_map:
+                    product_map[key] = []
+                product_map[key].append(i)
+
+        texts = []
+        for cpe, title in zip(cpe_items, titles):
+            vendor, product, version = parse_cpe_name(cpe)
+            text = f"{clean_text(vendor.replace('_', ' '))} {clean_text(product.replace('_', ' '))}"
+            if version:
+                text += f" {clean_text(version.replace('_', ' '))}"
+            if title:
+                text += f" {clean_text(title)}"
+            texts.append(text.strip())
+
+        embeddings = self._create_embeddings(texts)
+        return cpe_items, titles, embeddings, product_map
+
+    def _load_cpe_xml(self, filepath):
+        abs_path = os.path.abspath(filepath)
+        if not os.path.exists(abs_path):
+            print(f"Error: XML not found: {abs_path}")
+            return None
+        try:
+            return ET.parse(filepath).getroot()
+        except Exception as e:
+            print(f"Error parsing XML: {e}")
+            return None
+
+    def _extract_cpe_items(self, root):
+        ns = {
+            'cpe': 'http://cpe.mitre.org/dictionary/2.0',
+            'cpe-23': 'http://scap.nist.gov/schema/cpe-extension/2.3',
+        }
+        cpe_items, titles = [], []
+        for item in root.findall(".//cpe:cpe-item", namespaces=ns):
+            cpe23 = item.find(".//cpe-23:cpe23-item", namespaces=ns)
+            if cpe23 is not None and cpe23.get("name"):
+                title_el = item.find(".//cpe:title", namespaces=ns)
+                cpe_items.append(cpe23.get("name"))
+                titles.append(title_el.text if title_el is not None else "")
+        return cpe_items, titles
+
+    def _create_embeddings(self, texts):
+        dim = self.model.get_sentence_embedding_dimension()
+        embeddings = np.zeros((len(texts), dim), dtype=np.float32)
+        with tqdm(total=len(texts), desc="Generating embeddings") as pbar:
+            for i in range(0, len(texts), self.config['batch_size']):
+                batch = texts[i:i + self.config['batch_size']]
+                if i > 0 and i % (self.config['batch_size'] * 10) == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                try:
+                    batch_emb = self.model.encode(batch, convert_to_numpy=True)
+                    end = min(i + self.config['batch_size'], len(texts))
+                    embeddings[i:end] = batch_emb
+                except Exception as e:
+                    print(f"Error on batch {i}: {e}")
+                pbar.update(len(batch))
+        return embeddings
+
+    def _build_faiss_index(self):
+        _t = time.time()
+        print("Building FAISS index...")
+        emb = np.array(self.embeddings, dtype=np.float32)
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        self._embeddings_normalized = emb / norms
+        index = faiss.IndexFlatIP(emb.shape[1])
+        index.add(self._embeddings_normalized)
+        self._faiss_index = index
+        print(f"FAISS index ready ({index.ntotal} vectors, {time.time()-_t:.2f}s).")
+
+    def search(self, vendor, product, version, num_results=None):
+        """
+        Search for matching CPEs.
+
+        Returns list of dicts:
+          {score, cpe, title, is_exact_product_match,
+           score_breakdown: {semantic, vendor, product, version}}
+        """
+        if num_results is None:
+            num_results = self.config['num_results']
+
+        query = " ".join(filter(None, [
+            clean_text(vendor), clean_text(product), clean_text(version)
+        ])).strip()
+        if not query:
+            return []
+
+        _t = time.time()
+        query_embedding = self.model.encode([query], convert_to_numpy=True)
+        print(f"  Query embedding: {time.time()-_t:.3f}s")
+        _t = time.time()
+
+        exact_indices = set()
+        if product:
+            normalized_product = product.lower().replace('_', ' ')
+            exact_indices = set(self.product_map.get(normalized_product, []))
+
+        k = min(num_results * 20, len(self.cpe_items))
+
+        if _FAISS_AVAILABLE and self._faiss_index is not None:
+            q_norm = query_embedding / (np.linalg.norm(query_embedding) or 1.0)
+            distances, faiss_ids = self._faiss_index.search(q_norm.astype(np.float32), k)
+            sim_map = {int(i): float(d) for i, d in zip(faiss_ids[0], distances[0]) if i >= 0}
+            top_semantic_indices = set(sim_map.keys())
+            extra = exact_indices - top_semantic_indices
+            if extra:
+                extra_list = list(extra)
+                extra_sims = (q_norm @ self._embeddings_normalized[extra_list].T)[0]
+                for idx, sim in zip(extra_list, extra_sims):
+                    sim_map[idx] = float(sim)
+            candidates = exact_indices.union(top_semantic_indices)
+            def _get_sim(idx): return sim_map.get(idx, 0.0)
+        else:
+            similarities = cosine_similarity(query_embedding, self.embeddings)[0]
+            top_semantic_indices = set(int(i) for i in similarities.argsort()[-k:][::-1])
+            candidates = exact_indices.union(top_semantic_indices)
+            def _get_sim(idx): return float(similarities[idx])
+
+        results = []
+        for idx in candidates:
+            cpe = self.cpe_items[idx]
+            title = self.titles[idx] if idx < len(self.titles) else ""
+            cpe_vendor, cpe_product, cpe_version = parse_cpe_name(cpe)
+
+            is_exact = (
+                product.lower().replace('_', ' ') == cpe_product.lower().replace('_', ' ')
+                if product and cpe_product else False
+            )
+
+            v_score = levenshtein_similarity(vendor, cpe_vendor.replace('_', ' ')) if vendor and cpe_vendor else 0.5
+            p_score = levenshtein_similarity(product, cpe_product.replace('_', ' ')) if product and cpe_product else 0.0
+            ver_score = version_similarity(version, cpe_version.replace('_', ' ')) if version else 0.5
+            sem_score = _get_sim(idx)
+
+            combined = (
+                sem_score * self.config['semantic_weight']
+                + v_score * self.config['vendor_weight']
+                + p_score * self.config['product_weight']
+                + ver_score * self.config['version_weight']
+            )
+
+            results.append({
+                'score': combined,
+                'cpe': cpe,
+                'title': title,
+                'is_exact_product_match': is_exact,
+                'score_breakdown': {
+                    'semantic': sem_score,
+                    'vendor': v_score,
+                    'product': p_score,
+                    'version': ver_score,
+                },
+            })
+
+        print(f"  Scored {len(candidates)} candidates in {time.time()-_t:.3f}s")
+        results.sort(key=lambda x: (x['is_exact_product_match'], x['score']), reverse=True)
+
+        seen = set()
+        deduped = []
+        for r in results:
+            canonical = get_canonical_cpe(r['cpe'])
+            if canonical not in seen:
+                deduped.append(r)
+                seen.add(canonical)
+
+        return deduped[:num_results]
+
+    def process_excel(self, excel_path, output_path=None):
+        """Batch-process an Excel file using parallel workers. Returns True on success."""
+        try:
+            df = pd.read_excel(excel_path)
+            required = ['Vendor', 'Product', 'Version', 'CPE', 'Levenshtein score']
+            missing = [c for c in required if c not in df.columns]
+            if missing:
+                print(f"Missing columns: {', '.join(missing)}")
+                return False
+
+            threshold = self.config['min_score_threshold']
+            max_workers = self.config.get('max_workers', 1)
+            faiss_min_rows = self.config['faiss_min_rows']
+            row_count = len(df)
+
+            if _FAISS_AVAILABLE and self._faiss_index is None and row_count >= faiss_min_rows:
+                print(f"{row_count} rows >= threshold {faiss_min_rows}: building FAISS index...")
+                self._build_faiss_index()
+            elif row_count < faiss_min_rows:
+                print(f"{row_count} rows < threshold {faiss_min_rows}: using brute-force cosine.")
+
+            print(f"Processing {row_count} rows (threshold={threshold}, workers={max_workers})...")
+
+            def _process_row(args):
+                idx, row = args
+                vendor = str(row['Vendor']) if not pd.isna(row['Vendor']) else ""
+                product = str(row['Product']) if not pd.isna(row['Product']) else ""
+                version = str(row['Version']) if not pd.isna(row['Version']) else ""
+                if not product:
+                    return idx, None, None
+                results = self.search(vendor, product, version, num_results=1)
+                if results and results[0]['score'] > threshold:
+                    r = results[0]
+                    return idx, adjust_cpe_version(r['cpe'], version), r['score']
+                return idx, None, None
+
+            rows = list(df.iterrows())
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_process_row, row): row[0] for row in rows}
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
+                    idx, cpe_val, score_val = future.result()
+                    if cpe_val is not None:
+                        df.at[idx, 'CPE'] = cpe_val
+                        df.at[idx, 'Levenshtein score'] = score_val
+
+            if not output_path:
+                base, _ = os.path.splitext(excel_path)
+                output_path = f"{base}_updated.xlsx"
+
+            df.to_excel(output_path, index=False)
+            print(f"Saved to {output_path}")
+            return True
+        except Exception as e:
+            print(f"Error processing Excel: {e}")
+            return False
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _interactive_mode(matcher):
     while True:
         print("\n=== Search for CPE codes ===")
-        vendor = input("Enter vendor name (leave empty if unknown, 'q' to quit): ")
-        if vendor.lower() == 'q': break
-            
-        product = input("Enter product name ('q' to quit): ")
-        if product.lower() == 'q': break
+        vendor = input("Vendor (empty=unknown, 'q'=quit): ")
+        if vendor.lower() == 'q':
+            break
+        product = input("Product ('q'=quit): ")
+        if product.lower() == 'q':
+            break
         if not product:
-            print("Product name is required for search.")
+            print("Product name is required.")
             continue
-            
-        version = input("Enter product version: ")
-        
-        print("\nSearching...")
-        search_start = time.time()
-        results = find_closest_cpes(vendor, product, version, cpe_items, titles, embeddings, model, device, product_map)
-        search_time = time.time() - search_start
-        
+        version = input("Version: ")
+
+        t0 = time.time()
+        results = matcher.search(vendor, product, version)
+        elapsed = time.time() - t0
+
         if results:
-            print(f"\nCPE codes found for '{vendor} {product} {version}' (in {search_time:.2f} seconds):")
-            for score, cpe, title in results:
-                vendor_part, product_part, version_part = parse_cpe_name(cpe)
-                print(f"- {cpe}")
-                print(f"  Score: {score:.4f}")
-                print(f"  Vendor: {vendor_part.replace('_', ' ')}")
-                print(f"  Product: {product_part.replace('_', ' ')}")
-                print(f"  Version: {version_part.replace('_', ' ')}")
-                if title:
-                    print(f"  Description: {title}")
+            print(f"\nResults for '{vendor} {product} {version}' ({elapsed:.2f}s):")
+            for r in results:
+                v, p, ver = parse_cpe_name(r['cpe'])
+                bd = r['score_breakdown']
+                print(f"- {r['cpe']}")
+                print(f"  Score: {r['score']:.4f}  "
+                      f"(semantic={bd['semantic']:.3f}, vendor={bd['vendor']:.3f}, "
+                      f"product={bd['product']:.3f}, version={bd['version']:.3f})")
+                print(f"  Vendor: {v.replace('_', ' ')}  "
+                      f"Product: {p.replace('_', ' ')}  "
+                      f"Version: {ver.replace('_', ' ')}")
+                if r['title']:
+                    print(f"  Title: {r['title']}")
                 print()
         else:
-            print(f"No CPE codes found for '{vendor} {product} {version}'.")
+            print(f"No results for '{vendor} {product} {version}'.")
 
-def main(model):
-    parser = argparse.ArgumentParser(description="CPE Matcher with MiniLM and Levenshtein")
-    parser.add_argument("-data", help="Path to Excel file with vendor, product, and version data", type=str, default=None)
-    parser.add_argument("-output", help="Path to Excel output file", type=str, default=None)
-    parser.add_argument("--force-regenerate", help="Force regeneration of CPE data and embeddings", action="store_true")
-    parser.add_argument("--use-mini-llm", help="Use the MiniLM model instead of the default", action="store_true")
+
+def main():
+    parser = argparse.ArgumentParser(description="CPE Matcher")
+    parser.add_argument("-data", help="Excel file path", type=str, default=None)
+    parser.add_argument("-output", help="Excel output path", type=str, default=None)
+    parser.add_argument("--force-regenerate", action="store_true")
+    parser.add_argument("--use-mini-llm", action="store_true")
     args = parser.parse_args()
 
-    print("\n=== CPE Matcher with MiniLM and Levenshtein (Auto-download version) ===")
-    
-    # Modify cache file paths if using the mini model
-    if args.use_mini_llm:
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-        # Only the embeddings are model-specific. The CPE data can be shared.
-        config['embeddings_filepath'] = os.path.join(project_root, 'cpe_embeddings_minilm.npy')
-        print(f"Using MiniLM-specific embeddings file: {config['embeddings_filepath']}")
-    
-    start_time = time.time()
-    
-    cpe_items, titles, embeddings, product_map = None, None, None, None
-    
-    # Decide whether to load or regenerate data
-    should_regenerate = args.force_regenerate or not os.path.exists(config['pickle_filepath']) or not os.path.exists(config['embeddings_filepath'])
-    
-    if args.output:
-        print(f"Output will be saved to: {args.output}")
-        output_path = args.output
-    else:
-        output_path = None
+    print("\n=== CPE Matcher ===")
+    matcher = CPEMatcher(use_mini=args.use_mini_llm)
+    matcher.load_data(force_regenerate=args.force_regenerate)
 
-    if not should_regenerate:
-        print("Loading existing data...")
-        cpe_items, titles, embeddings, product_map = load_cpe_data(config['pickle_filepath'], config['embeddings_filepath'])
-        # If product_map is missing, we must regenerate
-        if not product_map:
-            print("Product map is missing from cached data. Forcing regeneration.")
-            should_regenerate = True
-
-    if should_regenerate:
-        if args.force_regenerate:
-            print("Forcing regeneration of CPE data and embeddings...")
-        else:
-            print("No complete existing data found. Preparing new CPE data...")
-        cpe_items, titles, embeddings, product_map = prepare_cpe_data(config['xml_filepath'], model, device)
-        if cpe_items is not None:
-            save_cpe_data(cpe_items, titles, embeddings, product_map, config['pickle_filepath'], config['embeddings_filepath'])
-
-    processing_time = time.time() - start_time
-    print(f"Data preparation/loading time: {processing_time:.2f} seconds")
-    
-    if not cpe_items or embeddings is None or product_map is None:
-        print("Cannot continue without valid CPE data and product map.")
+    if not matcher.cpe_items or matcher.embeddings is None:
+        print("Cannot continue without valid CPE data.")
         return
-    
+
     if args.data:
-        excel_path = args.data
-        if not os.path.exists(excel_path):
-            print(f"Error: The specified Excel file does not exist: {excel_path}")
+        if not os.path.exists(args.data):
+            print(f"Error: file not found: {args.data}")
             return
-        
-        print(f"Running in Excel processing mode with file: {excel_path}")
-        process_excel_file(excel_path, cpe_items, titles, embeddings, model, device, product_map, output_path)
+        matcher.process_excel(args.data, args.output)
     else:
-        print("Running in interactive mode.")
-        interactive_mode(cpe_items, titles, embeddings, model, device, product_map)
+        _interactive_mode(matcher)
+
 
 if __name__ == "__main__":
-    main(model)
+    main()

@@ -103,7 +103,8 @@ def generate_cpe_dictionary():
     """
     parser = argparse.ArgumentParser(description="Generate CPE dictionary from NVD API.")
     parser.add_argument("--output-csv", action="store_true", help="Also generate a CSV file with CPE data.")
-    parser.add_argument("--fetch-all", action="store_true", help="Fetch all CPEs from the NVD API.")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Limit to N CPEs (for testing). Default: fetch all.")
     args = parser.parse_args()
 
     api_key = get_api_key()
@@ -152,23 +153,25 @@ def generate_cpe_dictionary():
 
     all_cpe_data_for_csv = [] # To store data for CSV output
 
-    total_results = 0
     processed_count = 0
-    
-    if args.fetch_all:
-        # Fetch all results
-        try:
-            response = requests.get(base_url, headers=headers, params={"resultsPerPage": 1, "startIndex": 0}, proxies=proxies, timeout=30)
-            response.raise_for_status()
-            total_results = response.json().get("totalResults", 0)
-            print(f"Total CPEs to fetch: {total_results}")
-        except requests.exceptions.RequestException as e:
-            print(f"Failed to get total results: {e}", file=sys.stderr)
-            sys.exit(1)
+
+    # Always fetch the API total first
+    try:
+        response = requests.get(base_url, headers=headers,
+                                params={"resultsPerPage": 1, "startIndex": 0},
+                                proxies=proxies, timeout=30)
+        response.raise_for_status()
+        api_total = response.json().get("totalResults", 0)
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to get total results: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.limit is not None:
+        total_results = min(args.limit, api_total)
+        print(f"Fetching {total_results} CPEs (--limit {args.limit}, API total: {api_total}).")
     else:
-        # Limit to 2 for testing
-        total_results = 2
-        print("Fetching only 2 CPEs for testing. Use --fetch-all to get all CPEs.")
+        total_results = api_total
+        print(f"Fetching all {total_results} CPEs from NVD API.")
 
 
     print("Starting CPE data fetch from NVD API...")

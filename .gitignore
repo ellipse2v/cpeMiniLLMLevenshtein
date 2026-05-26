@@ -9,3 +9,4 @@ cpe_dictionary.csv
 models/*
 *.pyc
 template_test_updated.xlsx
+venv/

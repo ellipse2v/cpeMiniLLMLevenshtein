@@ -16,77 +16,31 @@ import unittest
 import os
 import sys
 
-# Add src to the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.insert(0, project_root)
 
-from src.cpe_matcher.cpe_matcher import (
-    load_cpe_data,
-    prepare_cpe_data,
-    save_cpe_data,
-    find_closest_cpes,
-    parse_cpe_name,
-    config,
-    device,
-    model
-)
+from src.cpe_matcher.cpe_matcher import CPEMatcher, parse_cpe_name
+
 
 class TestUserCPERequest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Load all necessary data once for all tests."""
-        print("Setting up test class...")
-        should_regenerate = config['force_regenerate'] or not os.path.exists(config['pickle_filepath']) or not os.path.exists(config['embeddings_filepath'])
-
-        if not should_regenerate:
-            print("Loading existing data for tests...")
-            cls.cpe_items, cls.titles, cls.embeddings, cls.product_map = load_cpe_data(config['pickle_filepath'], config['embeddings_filepath'])
-            if not cls.product_map:
-                print("Product map missing. Forcing regeneration for tests.")
-                should_regenerate = True
-        
-        if should_regenerate:
-            print("Preparing new CPE data for tests...")
-            cls.cpe_items, cls.titles, cls.embeddings, cls.product_map = prepare_cpe_data(config['xml_filepath'], model, device)
-            if cls.cpe_items is not None:
-                save_cpe_data(cls.cpe_items, cls.titles, cls.embeddings, cls.product_map, config['pickle_filepath'], config['embeddings_filepath'])
-
-        if not cls.cpe_items or cls.embeddings is None or not cls.product_map:
-            raise Exception("Could not load or prepare CPE data for tests.")
-
-        print("Test class setup complete.")
+        cls.matcher = CPEMatcher()
+        cls.matcher.load_data()
+        if not cls.matcher.cpe_items or cls.matcher.embeddings is None:
+            raise Exception("Could not load CPE data.")
 
     def test_user_specific_query(self):
-        """
-        Tests with the user's specific query to check architecture handling.
-        """
-        vendor = 'microsoft'
-        product = 'windows_11'
-        version = '2147562'
+        results = self.matcher.search('microsoft', 'windows_11', '2147562', num_results=10)
+        self.assertTrue(results)
+        for i, r in enumerate(results[:10]):
+            _, p, _ = parse_cpe_name(r['cpe'])
+            bd = r['score_breakdown']
+            print(f"{i+1}. {r['cpe']}  score={r['score']:.4f} "
+                  f"(sem={bd['semantic']:.3f}, v={bd['vendor']:.3f}, "
+                  f"p={bd['product']:.3f}, ver={bd['version']:.3f})")
 
-        print(f"\n--- Running test: test_user_specific_query with query: {vendor} {product} {version} ---")
-        
-        results = find_closest_cpes(
-            vendor=vendor,
-            product=product,
-            version=version,
-            cpe_items=self.cpe_items,
-            titles=self.titles,
-            embeddings=self.embeddings,
-            model=model,
-            device=device,
-            product_map=self.product_map,
-            num_results=10
-        )
-
-        self.assertTrue(results, "Should return at least one result")
-
-        print("\nTop 10 results from the user's test query:")
-        for i, (score, cpe, title) in enumerate(results[:10]):
-            _, p_name, _ = parse_cpe_name(cpe)
-            p_name_normalized = p_name.replace('_', ' ')
-            print(f"{i+1}. CPE: {cpe}, Product: {p_name_normalized}, Score: {score:.4f}")
 
 if __name__ == '__main__':
     unittest.main()
