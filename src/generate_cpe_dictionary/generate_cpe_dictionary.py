@@ -156,15 +156,22 @@ def generate_cpe_dictionary():
     processed_count = 0
 
     # Always fetch the API total first
-    try:
-        response = requests.get(base_url, headers=headers,
-                                params={"resultsPerPage": 1, "startIndex": 0},
-                                proxies=proxies, timeout=30)
-        response.raise_for_status()
-        api_total = response.json().get("totalResults", 0)
-    except requests.exceptions.RequestException as e:
-        print(f"Failed to get total results: {e}", file=sys.stderr)
-        sys.exit(1)
+    for attempt in range(5):
+        try:
+            response = requests.get(base_url, headers=headers,
+                                    params={"resultsPerPage": 1, "startIndex": 0},
+                                    proxies=proxies, timeout=60)
+            response.raise_for_status()
+            api_total = response.json().get("totalResults", 0)
+            break
+        except requests.exceptions.RequestException as e:
+            wait = [5, 15, 30, 60, 120][attempt]
+            print(f"Failed to get total results (attempt {attempt+1}/5): {e}", file=sys.stderr)
+            if attempt < 4:
+                print(f"Retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                sys.exit(1)
 
     if args.limit is not None:
         total_results = min(args.limit, api_total)
@@ -176,12 +183,29 @@ def generate_cpe_dictionary():
 
     print("Starting CPE data fetch from NVD API...")
 
+    MAX_RETRIES = 5
+    RETRY_BACKOFF = [5, 15, 30, 60, 120]
+
     while processed_count < total_results:
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = requests.get(base_url, headers=headers, params=params, proxies=proxies, timeout=60)
+                response.raise_for_status()
+                data = response.json()
+                break
+            except requests.exceptions.RequestException as e:
+                wait = RETRY_BACKOFF[attempt]
+                print(f"\nRequest error (attempt {attempt+1}/{MAX_RETRIES}): {e}", file=sys.stderr)
+                if attempt < MAX_RETRIES - 1:
+                    print(f"Retrying in {wait}s...", file=sys.stderr)
+                    time.sleep(wait)
+                else:
+                    print("Max retries reached. Aborting.", file=sys.stderr)
+                    raise
+        else:
+            break
+
         try:
-            response = requests.get(base_url, headers=headers, params=params, proxies=proxies, timeout=30)
-            response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx) 
-            
-            data = response.json()
             products = data.get("products", [])
 
             if not products:
@@ -191,16 +215,16 @@ def generate_cpe_dictionary():
             for product in products:
                 if processed_count >= total_results:
                     break
-                
+
                 cpe_data = product.get("cpe", {})
                 cpe_uri = cpe_data.get("cpeName")
-                
+
                 if not cpe_uri:
                     continue
 
                 # For XML output
                 cpe_item = SubElement(root, "cpe-item", name=cpe_uri)
-                
+
                 # Add titles
                 for title_data in cpe_data.get("titles", []):
                     title_text = title_data.get("title")
@@ -209,7 +233,7 @@ def generate_cpe_dictionary():
                         title_elem = SubElement(cpe_item, "title")
                         title_elem.set("{http://www.w3.org/XML/1998/namespace}lang", lang)
                         title_elem.text = title_text
-                
+
                 # Add references
                 refs = cpe_data.get("refs", [])
                 if refs:
@@ -232,21 +256,17 @@ def generate_cpe_dictionary():
                     })
 
                 processed_count += 1
-            
+
             params["startIndex"] += len(products)
-            
+
             print(f"Fetched {processed_count} of {total_results} CPEs...")
 
             # NVD API rate limiting
             time.sleep(1)
 
-        except requests.exceptions.RequestException as e:
-            print(f"\nAn API request error occurred: {e}", file=sys.stderr)
-            print("Please check your network connection, API key, and proxy settings.", file=sys.stderr)
-            break # Exit loop on error
         except Exception as e:
             print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
-            break # Exit loop on error
+            break
 
     print(f"\nSuccessfully fetched {processed_count} CPEs.")
     

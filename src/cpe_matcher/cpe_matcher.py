@@ -469,7 +469,14 @@ class CPEMatcher:
             )
 
             v_score = levenshtein_similarity(vendor, cpe_vendor.replace('_', ' ')) if vendor and cpe_vendor else 0.5
-            p_score = levenshtein_similarity(product, cpe_product.replace('_', ' ')) if product and cpe_product else 0.0
+            if product and cpe_product:
+                cpe_prod_norm = cpe_product.replace('_', ' ').lower()
+                prod_norm = product.lower()
+                p_score = levenshtein_similarity(product, cpe_product.replace('_', ' '))
+                if prod_norm in cpe_prod_norm or cpe_prod_norm in prod_norm:
+                    p_score = max(p_score, 0.8)
+            else:
+                p_score = 0.0
             ver_score = version_similarity(version, cpe_version.replace('_', ' ')) if version else 0.5
             sem_score = _get_sim(idx)
 
