@@ -178,8 +178,9 @@ Switch model via `DEFAULT_MODEL` in `config.ini` (or `--use-mini-llm` to prefer 
 A case is `correct` when the CPE the Excel mode would write (top result above `MIN_SCORE_THRESHOLD`, version applied) has the expected `part:vendor:product` and the requested version.
 
 ```bash
-# Old version
+# Old version (c8b795b = last commit before the product-level matcher)
 git stash -u                       # if you have local changes
+git fetch origin main              # make sure c8b795b is available locally (git fetch --unshallow for shallow clones)
 git checkout c8b795b -- src/cpe_matcher/cpe_matcher.py
 python benchmark/run_benchmark.py --label before
 
