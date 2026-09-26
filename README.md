@@ -4,14 +4,15 @@ Match software names and versions to NVD CPE identifiers using a hybrid semantic
 
 ## Features
 
-- **Hybrid scoring**: semantic cosine similarity (sentence-transformers) + Levenshtein vendor/product matching + numeric version comparison
-- **Auto-FAISS ANN search**: builds a FAISS index automatically when processing ≥ `FAISS_MIN_ROWS` rows; falls back to brute-force cosine for small inputs
-- **Memory-mapped embeddings**: `mmap_mode='r'` loads the `.npy` file on demand — avoids loading 2–4 GB into RAM at startup
-- **Secure JSON cache**: `cpe_data.json.gz` + SHA-256 integrity file replaces the old pickle cache
+- **Product-level index**: the NVD dictionary has ~1.5 M CPE names but only ~145 k distinct `part:vendor:product` triples. One embedding is computed per product (10× fewer vectors, ~220 MB instead of ~2.2 GB for MiniLM)
+- **Version substitution**: once the product is identified, the requested version is looked up in the dictionary. If NVD does not list it, a valid CPE is built from the product with the version substituted (e.g. Internet Explorer `2.0` → `cpe:2.3:a:microsoft:internet_explorer:2.0:*:*:*:*:*:*:*`). Results say whether the version was found (`version_in_dictionary`) and which dictionary entry was used (`reference_cpe`)
+- **Hybrid scoring**: semantic cosine similarity (sentence-transformers) + Levenshtein vendor/product matching (company suffixes such as *Inc.*, *Corporation* ignored, vendor name stripped from the product: *Microsoft SQL Server* → *sql server*) + numeric version comparison
+- **Batch search**: Excel rows are encoded and compared in batches (one matrix product per chunk, FAISS when installed) instead of one query at a time
+- **Incremental embeddings**: after an NVD update only the new products are encoded
+- **Automatic refresh**: when `official-cpe-dictionary_v2.3.xml` (produced by `generate_cpe_dictionary.py`) is newer than `cpe_data.json.gz`, the cache is rebuilt from it; deprecated CPEs are skipped
+- **Secure JSON cache**: `cpe_data.json.gz` + SHA-256 integrity file
 - **Score breakdown**: every result shows `semantic`, `vendor`, `product`, `version` sub-scores
-- **Configurable threshold**: `MIN_SCORE_THRESHOLD` filters low-confidence matches
-- **Parallel Excel processing**: `MAX_WORKERS` threads for batch mode
-- **Benchmark timers**: model load, JSON load, FAISS build, per-query embedding and scoring times
+- **Before/after benchmark**: `benchmark/` holds a labelled test set and a runner to measure accuracy and speed
 
 ## Installation
 
@@ -28,16 +29,20 @@ pip install sentence-transformers faiss-cpu scikit-learn numpy pandas tqdm lxml 
 cpeMiniLLMLevenshtein/
 ├── src/
 │   ├── cpe_matcher/
-│   │   ├── cpe_matcher.py          # Main matcher (CPEMatcher class)
-│   │   ├── config.ini              # All tunable parameters
+│   │   ├── cpe_matcher.py          # Main matcher (CPEMatcher, ProductIndex)
+│   │   ├── config.ini              # Optional, overrides the built-in defaults
 │   │   └── test_cpe_matcher.py     # Unit tests
 │   └── generate_cpe_dictionary/
 │       ├── generate_cpe_dictionary.py
 │       └── test_generate_cpe_dictionary.py
+├── benchmark/
+│   ├── cpe_benchmark_cases.csv     # Labelled queries (exact, substituted, variants, typos, negatives)
+│   └── run_benchmark.py            # Accuracy + timing, before/after comparison
 ├── cpe_data.json.gz                # CPE metadata cache (gzip + JSON)
 ├── cpe_data.json.gz.sha256         # Integrity check for the cache
-├── cpe_embeddings_minilm.npy       # Sentence-transformer embeddings
-├── official-cpe-dictionary_v2.3.xml
+├── cpe_product_embeddings_<model>.npy        # One embedding per product (generated)
+├── cpe_product_embeddings_<model>.texts.json.gz  # Texts of those embeddings (incremental reuse)
+├── official-cpe-dictionary_v2.3.xml          # Produced by generate_cpe_dictionary.py
 ├── requirements.txt
 └── README.md
 ```
@@ -81,81 +86,111 @@ Enter queries like `microsoft windows_11 22000`.
 python cpe_matcher.py --input path/to/software_list.xlsx --output results.xlsx
 ```
 
-### Force regeneration of cache and embeddings
+### Force regeneration of the embeddings
 
 ```bash
 python cpe_matcher.py --force-regenerate
 ```
 
-### Generate / update the CPE dictionary XML
+### Update the NVD CPE dictionary
 
 ```bash
-# Fetch all CPEs from NVD (default)
+# 1. Fetch all CPEs from the NVD API (needs an API key in src/generate_cpe_dictionary/config.ini)
 python src/generate_cpe_dictionary/generate_cpe_dictionary.py
 
-# Fetch only the first N CPEs (for testing)
-python src/generate_cpe_dictionary/generate_cpe_dictionary.py --limit 5000
+# 2. Run the matcher: the XML being newer than cpe_data.json.gz, the cache is
+#    rebuilt from it and only the new products are embedded
+python src/cpe_matcher/cpe_matcher.py
 ```
+
+`--limit 5000` fetches only the first N CPEs (for testing).
 
 ## Configuration (`config.ini`)
 
+`src/cpe_matcher/config.ini` is optional: every key has a built-in default.
+
 ```ini
 [Models]
-FALLBACK_MODEL = sentence-transformers/all-mpnet-base-v2
 DEFAULT_MODEL  = sentence-transformers/all-MiniLM-L6-v2
+FALLBACK_MODEL = sentence-transformers/all-mpnet-base-v2
 
 [Paths]
-FALLBACK_MODEL_PATH    = models/all-mpnet-base-v2
 DEFAULT_MODEL_PATH     = models/all-MiniLM-L6-v2
+FALLBACK_MODEL_PATH    = models/all-mpnet-base-v2
 CPE_DATA_JSON          = cpe_data.json.gz
-CPE_EMBEDDINGS_NUMPY   = cpe_embeddings_minilm.npy
 CPE_DICTIONARY_XML     = official-cpe-dictionary_v2.3.xml
+EMBEDDINGS_DIR         = .       # where cpe_product_embeddings_<model>.npy is stored
 
 [Settings]
-BATCH_SIZE             = 128     # Embedding batch size
-NUM_RESULTS            = 5       # Candidates returned per query
+BATCH_SIZE             = 256     # Embedding batch size
+NUM_RESULTS            = 5       # Products returned per query
 FORCE_REGENERATE       = false
 SEMANTIC_SCORE_WEIGHT  = 0.5
 VENDOR_SCORE_WEIGHT    = 0.2
 PRODUCT_SCORE_WEIGHT   = 0.2
 VERSION_SCORE_WEIGHT   = 0.1
-MIN_SCORE_THRESHOLD    = 0.7     # Discard results below this score
-MAX_WORKERS            = 1       # Parallel threads for Excel batch
-FAISS_MIN_ROWS         = 100     # Build FAISS index above this row count
+MIN_SCORE_THRESHOLD    = 0.6     # Excel mode: discard results below this score
+SEMANTIC_TOP_K         = 50      # Products kept from the semantic search before re-ranking
 ```
+
+Keys of older config files (`CPE_EMBEDDINGS_NUMPY`, `MAX_WORKERS`, `FAISS_MIN_ROWS`) are ignored.
 
 ### Key parameters
 
 | Parameter | Effect |
 |---|---|
 | `MIN_SCORE_THRESHOLD` | Filter low-confidence matches (0.0–1.0) |
-| `FAISS_MIN_ROWS` | Row count above which FAISS is built; brute-force below |
-| `MAX_WORKERS` | Threads for batch Excel mode; keep low on limited RAM |
+| `SEMANTIC_TOP_K` | More candidates = better recall, slightly slower |
 | `SEMANTIC_SCORE_WEIGHT` | Weight of embedding cosine similarity in final score |
+| `VERSION_SCORE_WEIGHT` | 1.0 when the version is in NVD, 0.5–1.0 by closeness to the nearest known version otherwise |
 
 ## How It Works
 
-1. **Parse CPE XML** — extract 1.5 M+ CPE URIs and human-readable titles
-2. **Encode titles** with sentence-transformers — `.npy` embeddings saved once
-3. **At query time** — encode the query string; cosine similarity against all embeddings (or FAISS ANN when `FAISS_MIN_ROWS` is reached)
-4. **Re-rank** top candidates using Levenshtein vendor/product similarity and numeric version comparison
-5. **Return** results above `MIN_SCORE_THRESHOLD` with full score breakdown
+1. **Load** `cpe_data.json.gz` (or parse the XML dictionary, skipping deprecated entries)
+2. **Group** the ~1.5 M CPE names by `part:vendor:product` (~145 k products); each product gets a version-less text (`vendor product title`) and a map of its known versions
+3. **Encode** one embedding per product — saved once, only new products are encoded after an update
+4. **At query time** — encode `vendor product` (batched in Excel mode), take the `SEMANTIC_TOP_K` closest products plus the products whose name matches exactly (modulo case/separators, with and without the vendor prefix)
+5. **Re-rank** candidates with Levenshtein vendor/product similarity; exact product-name matches first
+6. **Resolve the version**: dictionary CPE when the version is known (`4` and `4.0` are equivalent; the least specific variant is preferred), otherwise the product CPE with the requested version substituted
 
-### Score breakdown example
+### Score breakdown example (illustrative values)
 
 ```
-cpe:2.3:o:microsoft:windows_11:22000:...   score=0.912
-  semantic=0.87  vendor=1.00  product=1.00  version=0.95
+cpe:2.3:a:microsoft:internet_explorer:2.0:*:*:*:*:*:*:*  [version substituted]
+  Score: 0.93  (semantic=0.95, vendor=1.000, product=1.000, version=0.800)
+  Based on: cpe:2.3:a:microsoft:internet_explorer:3.0:*:*:*:*:*:*:*
 ```
 
 ## Model Comparison
 
-| Model | Embedding dim | `.npy` size | Startup (mmap) | Quality |
-|---|---|---|---|---|
-| all-MiniLM-L6-v2 (default) | 384 | ~2.2 GB | ~11 s | Good |
-| all-mpnet-base-v2 (fallback) | 768 | ~4.4 GB | ~20 s | Better |
+| Model | Embedding dim | `.npy` size (products) | Quality |
+|---|---|---|---|
+| all-MiniLM-L6-v2 (default) | 384 | ~220 MB | Good |
+| all-mpnet-base-v2 (fallback) | 768 | ~440 MB | Better |
 
-Switch model via `DEFAULT_MODEL` and `CPE_EMBEDDINGS_NUMPY` in `config.ini`. Run with `--force-regenerate` once after switching.
+Switch model via `DEFAULT_MODEL` in `config.ini` (or `--use-mini-llm` to prefer the fallback). Each model has its own embeddings file, generated on first use.
+
+## Benchmark (before / after)
+
+`benchmark/cpe_benchmark_cases.csv` contains ~110 labelled queries checked against the NVD data:
+`exact` (version listed in NVD), `substituted` (version not listed), `variant` (inventory-style names such as *Mozilla Foundation / Mozilla Firefox*), `variant_substituted`, `typo`, and `negative` (invented software that must not match).
+
+A case is `correct` when the CPE the Excel mode would write (top result above `MIN_SCORE_THRESHOLD`, version applied) has the expected `part:vendor:product` and the requested version.
+
+```bash
+# Old version
+git stash -u                       # if you have local changes
+git checkout c8b795b -- src/cpe_matcher/cpe_matcher.py
+python benchmark/run_benchmark.py --label before
+
+# New version
+git checkout HEAD -- src/cpe_matcher/cpe_matcher.py
+python benchmark/run_benchmark.py --label after
+
+python benchmark/run_benchmark.py --compare benchmark/results_before.json benchmark/results_after.json
+```
+
+The comparison prints accuracy per category, timings (data load, mean query latency, batch throughput over `--repeat` × the cases) and the list of cases fixed/regressed. `--fake-model` runs the new version offline with a hashing encoder (sanity check only).
 
 ## Tests
 
@@ -164,7 +199,8 @@ Switch model via `DEFAULT_MODEL` and `CPE_EMBEDDINGS_NUMPY` in `config.ini`. Run
 python -m pytest src/cpe_matcher/test_cpe_matcher.py::TestModuleImport -v
 python -m pytest src/cpe_matcher/test_cpe_matcher.py::TestJSONCache -v
 python -m pytest src/cpe_matcher/test_cpe_matcher.py::TestVersionSimilarity -v
-python -m pytest src/cpe_matcher/test_cpe_matcher.py::TestFAISSSearch -v
+python -m pytest src/cpe_matcher/test_cpe_matcher.py::TestProductIndex -v
+python -m pytest src/cpe_matcher/test_cpe_matcher.py::TestCPEMatcherOffline -v   # fake encoder, tiny dictionary
 
 # Full end-to-end test (requires model + data files)
 python -m pytest src/cpe_matcher/test_cpe_matcher.py::TestCPEMatcher -v

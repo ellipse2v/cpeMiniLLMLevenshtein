@@ -22,6 +22,15 @@ sys.path.insert(0, project_root)
 from src.cpe_matcher.cpe_matcher import CPEMatcher, parse_cpe_name
 
 
+def _has_sentence_transformers():
+    try:
+        import sentence_transformers  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@unittest.skipUnless(_has_sentence_transformers(), "sentence-transformers not installed")
 class TestUserCPERequest(unittest.TestCase):
 
     @classmethod

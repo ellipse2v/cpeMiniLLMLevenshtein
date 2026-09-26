@@ -10,3 +10,5 @@ models/*
 *.pyc
 template_test_updated.xlsx
 venv/
+cpe_product_embeddings_*
+benchmark/results_*.json

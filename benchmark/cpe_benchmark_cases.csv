@@ -1,0 +1,114 @@
+category,vendor,product,version,expected_product,version_in_nvd
+exact,microsoft,internet explorer,6,a:microsoft:internet_explorer,true
+exact,mozilla,firefox,99.0,a:mozilla:firefox,true
+exact,apache,http server,2.4.9,a:apache:http_server,true
+exact,openssl,openssl,3.3.1,a:openssl:openssl,true
+exact,apache,tomcat,9.0.98,a:apache:tomcat,true
+exact,python,python,3.9.7,a:python:python,true
+exact,git-scm,git,2.9.5,a:git-scm:git,true
+exact,oracle,mysql,9.1.0,a:oracle:mysql,true
+exact,php,php,8.4.8,a:php:php,true
+exact,wireshark,wireshark,4.4.6,a:wireshark:wireshark,true
+exact,vmware,workstation,10.0.2,a:vmware:workstation,true
+exact,videolan,vlc media player,3.0.9,a:videolan:vlc_media_player,true
+exact,haxx,curl,8.9.0,a:haxx:curl,true
+exact,sqlite,sqlite,3.9.2,a:sqlite:sqlite,true
+exact,openbsd,openssh,9.8,a:openbsd:openssh,true
+exact,apache,log4j,2.9.1,a:apache:log4j,true
+exact,microsoft,exchange server,2019,a:microsoft:exchange_server,true
+exact,microsoft,sql server,2022,a:microsoft:sql_server,true
+exact,fortinet,fortios,7.6.3,o:fortinet:fortios,true
+exact,paloaltonetworks,pan-os,9.1.6,o:paloaltonetworks:pan-os,true
+exact,keepass,keepass,2.54,a:keepass:keepass,true
+exact,winscp,winscp,6.4.1,a:winscp:winscp,true
+exact,redis,redis,8.0.2,a:redis:redis,true
+exact,mongodb,mongodb,8.0.9,a:mongodb:mongodb,true
+exact,apple,safari,9.1.1,a:apple:safari,true
+exact,sudo_project,sudo,1.9.8,a:sudo_project:sudo,true
+exact,microsoft,.net framework,4.8.1,a:microsoft:.net_framework,true
+exact,nodejs,node.js,9.8.0,a:nodejs:node.js,true
+exact,microsoft,internet explorer,4.0,a:microsoft:internet_explorer,true
+exact,microsoft,internet explorer,3,a:microsoft:internet_explorer,true
+substituted,microsoft,internet explorer,2.0,a:microsoft:internet_explorer,false
+substituted,mozilla,firefox,999.1,a:mozilla:firefox,false
+substituted,apache,http server,2.4.999,a:apache:http_server,false
+substituted,openssl,openssl,3.3.99,a:openssl:openssl,false
+substituted,apache,tomcat,9.0.999,a:apache:tomcat,false
+substituted,python,python,3.9.99,a:python:python,false
+substituted,git-scm,git,2.9.99,a:git-scm:git,false
+substituted,php,php,8.4.99,a:php:php,false
+substituted,wireshark,wireshark,4.4.99,a:wireshark:wireshark,false
+substituted,vmware,workstation,10.0.99,a:vmware:workstation,false
+substituted,videolan,vlc media player,3.0.99,a:videolan:vlc_media_player,false
+substituted,haxx,curl,8.9.99,a:haxx:curl,false
+substituted,sqlite,sqlite,3.9.99,a:sqlite:sqlite,false
+substituted,openbsd,openssh,9.99,a:openbsd:openssh,false
+substituted,keepass,keepass,2.99,a:keepass:keepass,false
+substituted,winscp,winscp,6.4.99,a:winscp:winscp,false
+substituted,redis,redis,8.0.99,a:redis:redis,false
+substituted,rarlab,winrar,7.99,a:rarlab:winrar,false
+substituted,7-zip,7-zip,9.99,a:7-zip:7-zip,false
+substituted,putty,putty,0.99,a:putty:putty,false
+substituted,nginx,nginx,1.9.99,a:nginx:nginx,false
+substituted,gimp,gimp,3.1.99,a:gimp:gimp,false
+substituted,mozilla,thunderbird,91.99,a:mozilla:thunderbird,false
+substituted,apple,itunes,9.2.99,a:apple:itunes,false
+substituted,elastic,elasticsearch,8.9.99,a:elastic:elasticsearch,false
+substituted,apache,struts,7.0.99,a:apache:struts,false
+substituted,microsoft,silverlight,5.1.99999.0,a:microsoft:silverlight,false
+substituted,oracle,virtualbox,7.0.12,a:oracle:virtualbox,false
+substituted,trendmicro,officescan,13.0,a:trendmicro:officescan,false
+substituted,microsoft,excel,2024,a:microsoft:excel,false
+variant,Microsoft Corporation,Internet Explorer,8,a:microsoft:internet_explorer,true
+variant,Mozilla Foundation,Mozilla Firefox,99.0,a:mozilla:firefox,true
+variant,The Apache Software Foundation,Apache HTTP Server,2.4.9,a:apache:http_server,true
+variant,The OpenSSL Project,OpenSSL,3.3.1,a:openssl:openssl,true
+variant,Python Software Foundation,Python,3.9.7,a:python:python,true
+variant,VideoLAN,VLC,3.0.9,a:videolan:vlc_media_player|a:videolan:vlc,true
+variant,Notepad++ Team,Notepad++,8.7.5,a:notepad-plus-plus:notepad\+\+,true
+variant,Oracle Corporation,MySQL Server,9.1.0,a:oracle:mysql|a:oracle:mysql_server,true
+variant,The Wireshark developer community,Wireshark,4.4.6,a:wireshark:wireshark,true
+variant,"VMware, Inc.",VMware Workstation,10.0.2,a:vmware:workstation,true
+variant,Microsoft,Microsoft SQL Server,2019,a:microsoft:sql_server,true
+variant,Microsoft,Microsoft .NET Framework,4.8.1,a:microsoft:.net_framework,true
+variant,Microsoft,Visual Studio Code,1.80.0,a:microsoft:visual_studio_code,true
+variant,Node.js Foundation,Node.js,9.8.0,a:nodejs:node.js,true
+variant,Adobe Systems Incorporated,Adobe Acrobat Reader DC,25.001.20531,a:adobe:acrobat_reader_dc,true
+variant,win.rar GmbH,WinRAR,7.13,a:rarlab:winrar,true
+variant,Igor Pavlov,7-Zip,9.38,a:7-zip:7-zip,true
+variant,Simon Tatham,PuTTY,0.83,a:putty:putty|a:simon_tatham:putty,true
+variant,Apple Inc.,iTunes,10.1.1,a:apple:itunes,true
+variant,,Apache Tomcat,9.0.98,a:apache:tomcat,true
+variant,,Wireshark,4.4.6,a:wireshark:wireshark,true
+variant,,FileZilla Client,3.9.0.6,a:filezilla-project:filezilla_client,true
+variant,The GIMP Team,GNU Image Manipulation Program,3.0.4,a:gimp:gimp,true
+variant,Oracle,VM VirtualBox,3.0.6,a:oracle:virtualbox|a:oracle:vm_virtualbox,true
+variant,microsoft,internet_explorer,7,a:microsoft:internet_explorer,true
+typo,microsfot,internet explorer,6,a:microsoft:internet_explorer,true
+typo,mozila,firefox,99.0,a:mozilla:firefox,true
+typo,mozilla,firefx,99.0,a:mozilla:firefox,true
+typo,apache,tomact,9.0.98,a:apache:tomcat,true
+typo,openssl,opensll,3.3.1,a:openssl:openssl,true
+typo,wireshark,wiresharck,4.4.6,a:wireshark:wireshark,true
+typo,videolan,vlc media plyer,3.0.9,a:videolan:vlc_media_player,true
+typo,keepass,keepas,2.54,a:keepass:keepass,true
+typo,winscp,win scp,6.4.1,a:winscp:winscp,true
+typo,postgresql,postgres sql,9.6.9,a:postgresql:postgresql,true
+variant_substituted,Microsoft Corporation,Internet Explorer,2.0,a:microsoft:internet_explorer,false
+variant_substituted,Mozilla Foundation,Mozilla Firefox,999.1,a:mozilla:firefox,false
+variant_substituted,The Apache Software Foundation,Apache HTTP Server,2.4.999,a:apache:http_server,false
+variant_substituted,VideoLAN,VLC media player,3.0.99,a:videolan:vlc_media_player|a:videolan:vlc,false
+variant_substituted,Microsoft,Microsoft SQL Server,2031,a:microsoft:sql_server,false
+variant_substituted,Python Software Foundation,Python 3,3.99.1,a:python:python,false
+variant_substituted,Adobe Systems Incorporated,Adobe Acrobat Reader DC,26.001.20001,a:adobe:acrobat_reader_dc,false
+variant_substituted,Notepad++ Team,Notepad++,9.9.9,a:notepad-plus-plus:notepad\+\+,false
+variant_substituted,"VMware, Inc.",VMware Workstation,19.0.99,a:vmware:workstation,false
+variant_substituted,The OpenSSL Project,OpenSSL,3.3.99,a:openssl:openssl,false
+variant_substituted,Oracle Corporation,MySQL Community Server,9.9.1,a:oracle:mysql|a:oracle:mysql_server,false
+variant_substituted,,Apache Tomcat,9.0.999,a:apache:tomcat,false
+variant_substituted,,Wireshark,4.4.99,a:wireshark:wireshark,false
+variant_substituted,The Git Development Community,Git,2.99.1,a:git-scm:git,false
+variant_substituted,Mozilla,Mozilla Thunderbird,91.99,a:mozilla:thunderbird,false
+negative,Acme Widgets Ltd,Zorblax Quantum Frobnicator,1.2.3,,
+negative,Contoso Internal,Payroll HR Portal Custom,4.1,,
+negative,qwxz,plumbrick vandelay,7,,
