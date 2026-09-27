@@ -6,7 +6,8 @@ Match software names and versions to NVD CPE identifiers using a hybrid semantic
 
 - **Product-level index**: the NVD dictionary has ~1.8 M CPE names but only ~150 k distinct `part:vendor:product` triples. One embedding is computed per product (10× fewer vectors, ~220 MB instead of ~2.2 GB for MiniLM)
 - **Version substitution**: once the product is identified, the requested version is looked up in the dictionary. If NVD does not list it, a valid CPE is built from the product with the version substituted (e.g. Internet Explorer `2.0` → `cpe:2.3:a:microsoft:internet_explorer:2.0:*:*:*:*:*:*:*`). Results say whether the version was found (`version_in_dictionary`) and which dictionary entry was used (`reference_cpe`)
-- **Hybrid scoring**: semantic cosine similarity (sentence-transformers) + Levenshtein vendor/product matching (company suffixes such as *Inc.*, *Corporation* ignored, vendor name stripped from the product: *Microsoft SQL Server* → *sql server*) + numeric version comparison
+- **Hybrid scoring**: semantic cosine similarity (sentence-transformers) + Levenshtein vendor/product matching (company suffixes such as *Inc.*, *Corporation* ignored, vendor name stripped from the product: *Microsoft SQL Server* → *sql server*) + numeric version comparison. Acronyms match (*GNU Image Manipulation Program* → `gimp`, *IIS* → `internet_information_services`); when NVD names the vendor after the product (`7-zip:7-zip`, `putty:putty`) an inventory vendor such as *Igor Pavlov* is not penalised
+- **Vendor renames** (`cpe_aliases.csv`): generated from NVD deprecations when the cache is rebuilt — a product whose CPEs are all deprecated maps to the only active product with the same name (`nginx:nginx` → `f5:nginx`, `elasticsearch:kibana` → `elastic:kibana`, ~1,750 rows). Rows with `source=manual` are yours and survive regeneration. One dict lookup per query
 - **Batch search**: Excel rows are encoded and compared in batches (one matrix product per chunk, FAISS when installed) instead of one query at a time
 - **Incremental embeddings**: after an NVD update only the new products are encoded
 - **Automatic refresh**: when `official-cpe-dictionary_v2.3.xml` (produced by `generate_cpe_dictionary.py`) is newer than `cpe_data.json.gz`, the cache is rebuilt from it; deprecated CPEs are skipped
@@ -40,6 +41,7 @@ cpeMiniLLMLevenshtein/
 │   └── run_benchmark.py            # Accuracy + timing, before/after comparison
 ├── cpe_data.json.gz                # CPE metadata cache (gzip + JSON), versioned — see "CPE data"
 ├── cpe_data.json.gz.sha256         # Integrity check for the cache
+├── cpe_aliases.csv                 # Vendor renames (auto from NVD deprecations + manual rows), versioned
 ├── cpe_product_embeddings_<model>.npy        # One embedding per product (generated)
 ├── cpe_product_embeddings_<model>.texts.json.gz  # Texts of those embeddings (incremental reuse)
 ├── official-cpe-dictionary_v2.3.xml          # Produced by generate_cpe_dictionary.py
@@ -133,6 +135,7 @@ DEFAULT_MODEL_PATH     = models/all-MiniLM-L6-v2
 FALLBACK_MODEL_PATH    = models/all-mpnet-base-v2
 CPE_DATA_JSON          = cpe_data.json.gz
 CPE_DICTIONARY_XML     = official-cpe-dictionary_v2.3.xml
+CPE_ALIASES_CSV        = cpe_aliases.csv
 EMBEDDINGS_DIR         = .       # where cpe_product_embeddings_<model>.npy is stored
 
 [Settings]
@@ -143,7 +146,7 @@ SEMANTIC_SCORE_WEIGHT  = 0.5
 VENDOR_SCORE_WEIGHT    = 0.2
 PRODUCT_SCORE_WEIGHT   = 0.2
 VERSION_SCORE_WEIGHT   = 0.1
-MIN_SCORE_THRESHOLD    = 0.6     # Excel mode: discard results below this score
+MIN_SCORE_THRESHOLD    = 0.65    # Excel mode: discard results below this score
 SEMANTIC_TOP_K         = 50      # Products kept from the semantic search before re-ranking
 ```
 
@@ -163,8 +166,8 @@ Keys of older config files (`CPE_EMBEDDINGS_NUMPY`, `MAX_WORKERS`, `FAISS_MIN_RO
 1. **Load** `cpe_data.json.gz` (or parse the XML dictionary, skipping deprecated entries)
 2. **Group** the ~1.7 M active CPE names by `part:vendor:product` (~150 k products); each product gets a version-less text (`vendor product title`) and a map of its known versions
 3. **Encode** one embedding per product — saved once, only new products are encoded after an update
-4. **At query time** — encode `vendor product` (batched in Excel mode), take the `SEMANTIC_TOP_K` closest products plus the products whose name matches exactly (modulo case/separators, with and without the vendor prefix)
-5. **Re-rank** candidates with Levenshtein vendor/product similarity; exact product-name matches first
+4. **At query time** — encode `vendor product` (batched in Excel mode), take the `SEMANTIC_TOP_K` closest products plus the products whose name matches exactly (modulo case/separators, with and without the vendor prefix) and the targets of `cpe_aliases.csv`
+5. **Re-rank** candidates with Levenshtein vendor/product similarity; exact product-name matches first (same spelling before same-modulo-separators); the version score is added on the 10 best before cutting
 6. **Resolve the version**: dictionary CPE when the version is known (`4` and `4.0` are equivalent; the least specific variant is preferred), otherwise the product CPE with the requested version substituted
 
 ### Score breakdown example (illustrative values)
@@ -219,7 +222,16 @@ python benchmark/run_benchmark.py --compare benchmark/results_before.json benchm
 
 - Right product ranked first: 96.4 % → 98.2 %; in top 5: 98.2 % → 100 %. 5 cases fixed, 0 regressed (threshold 0.7).
 - Batch: 8.4 → 225 rows/s (~27×); single query ~1.8 s → ~40 ms.
-- `MIN_SCORE_THRESHOLD` lowered to 0.6: invented software scores ≤ 0.56, correct products ≥ 0.64.
+
+Follow-up on the NVD dictionary of 2026-09-27 (acronyms, product-named vendors, exact-name tie-break, `cpe_aliases.csv`), `MIN_SCORE_THRESHOLD = 0.65`:
+
+| Category | Correct |
+|---|---|
+| exact / substituted / variant / typo / negative | 100.0 |
+| variant_substituted | 86.7 |
+| **All (113)** | **98.2** (right product in top 5: 100 %) |
+
+Invented software scores ≤ 0.56, correct matches ≥ 0.70. The two remaining misses (`mysql:mysql_community_server`, `git:git`) are real NVD products, just not the expected ones.
 
 The comparison prints accuracy per category, timings (data load, mean query latency, batch throughput over `--repeat` × the cases) and the list of cases fixed/regressed. `--fake-model` runs the new version offline with a hashing encoder (sanity check only).
 

@@ -39,6 +39,7 @@ import sys
 import time
 import argparse
 import configparser
+import csv
 import gc
 from collections import Counter
 import Levenshtein
@@ -68,6 +69,7 @@ DEFAULT_CONFIG = {
         'FALLBACK_MODEL_PATH': 'models/all-mpnet-base-v2',
         'CPE_DATA_JSON': 'cpe_data.json.gz',
         'CPE_DICTIONARY_XML': 'official-cpe-dictionary_v2.3.xml',
+        'CPE_ALIASES_CSV': 'cpe_aliases.csv',
         'EMBEDDINGS_DIR': '.',
     },
     'Settings': {
@@ -78,7 +80,7 @@ DEFAULT_CONFIG = {
         'VENDOR_SCORE_WEIGHT': '0.2',
         'PRODUCT_SCORE_WEIGHT': '0.2',
         'VERSION_SCORE_WEIGHT': '0.1',
-        'MIN_SCORE_THRESHOLD': '0.6',
+        'MIN_SCORE_THRESHOLD': '0.65',
         'SEMANTIC_TOP_K': '50',
     },
 }
@@ -141,7 +143,7 @@ def escape_cpe_value(value):
     whitespace -> '_', and every character other than [a-z0-9._-] escaped.
     Returns '*' for empty input.
     """
-    value = re.sub(r'\s+', '_', str(value).strip().lower())
+    value = re.sub(r'\s+', '_', unescape_cpe_value(str(value)).strip().lower())
     if not value:
         return '*'
     return ''.join(ch if re.match(r'[a-z0-9._\-]', ch) else '\\' + ch for ch in value)
@@ -213,8 +215,10 @@ def vendor_similarity(query_vendor, cpe_vendor):
     a, b = _strip_vendor_suffixes(query_vendor), _strip_vendor_suffixes(cpe_vendor)
     if not a or not b:
         return 0.0
-    if a == b:
+    if compact_key(query_vendor) == compact_key(cpe_vendor):
         return 1.0
+    if a == b:
+        return 0.95  # same name once 'Inc', 'Software Foundation', ... are removed
     score = levenshtein_similarity(a, b)
     if len(a) >= 3 and len(b) >= 3 and (a in b or b in a):
         score = max(score, 0.85)
@@ -231,6 +235,10 @@ def product_similarity(query_product, cpe_product):
     score = levenshtein_similarity(a, b)
     if a in b or b in a:
         score = max(score, 0.8)
+    # Acronyms: 'GNU Image Manipulation Program' -> gimp, 'IIS' -> internet_information_services
+    for words, other in ((a.split(), b), (b.split(), a)):
+        if len(words) >= 3 and ''.join(w[0] for w in words) == other.replace(' ', ''):
+            score = max(score, 0.95)
     return score
 
 
@@ -331,6 +339,49 @@ def _wildcard_count(parts):
     return sum(1 for p in parts[6:] if p in ('*', '-'))
 
 
+ALIAS_COLUMNS = ['part', 'old_vendor', 'old_product', 'new_vendor', 'new_product', 'source']
+
+
+def build_aliases(active_counts, deprecated_counts, min_ratio=0.25):
+    """
+    Vendor renames from NVD deprecations: a (part, vendor, product) whose CPEs
+    are all deprecated maps to the only active product with the same name
+    (nginx:nginx -> f5:nginx). The target must hold at least `min_ratio` as many
+    CPEs, which rules out namesakes such as a plugin (atlassian:confluence ->
+    mattermost:confluence).
+    """
+    by_name = {}
+    for key in active_counts:
+        by_name.setdefault((key[0], compact_key(key[2])), []).append(key)
+    aliases = []
+    for key, count in deprecated_counts.items():
+        if key in active_counts:
+            continue
+        targets = by_name.get((key[0], compact_key(key[2])), [])
+        if len(targets) == 1 and active_counts[targets[0]] >= min_ratio * count:
+            aliases.append((key, targets[0]))
+    return sorted(aliases)
+
+
+def load_aliases(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, newline='', encoding='utf-8') as f:
+        return list(csv.DictReader(f))
+
+
+def save_aliases(path, auto_aliases):
+    """Rewrite the 'auto' rows of the alias table, keeping the 'manual' ones."""
+    rows = [r for r in load_aliases(path) if r.get('source') == 'manual']
+    rows += [dict(zip(ALIAS_COLUMNS, [old[0], old[1], old[2], new[1], new[2], 'auto']))
+             for old, new in auto_aliases]
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, ALIAS_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Alias table saved ({path}, {len(rows)} rows)")
+
+
 class ProductIndex:
     """
     Groups CPE names by (part, vendor, product).
@@ -381,11 +432,13 @@ class ProductIndex:
             else:
                 bucket.append(i)
             votes = title_votes[pid]
-            if i < n_titles and titles[i] and sum(votes.values()) < 5:
+            if i < n_titles and titles[i] and sum(votes.values()) < 50:
                 stripped = strip_version_from_title(titles[i], parts[5:])
                 if stripped:
                     votes[stripped] += 1
 
+        self.key_to_id = key_to_id
+        self.aliases = {}
         self.texts = []
         self.display_titles = []
         for pid, (part, vendor, product) in enumerate(self.keys):
@@ -409,6 +462,25 @@ class ProductIndex:
 
     def __len__(self):
         return len(self.keys)
+
+    def set_aliases(self, rows):
+        """rows: dicts with ALIAS_COLUMNS (see load_aliases)."""
+        self.aliases = {}
+        for r in rows:
+            pid = self.key_to_id.get((r['part'], r['new_vendor'], r['new_product']))
+            if pid is not None:
+                key = (_strip_vendor_suffixes(r['old_vendor']), compact_key(r['old_product']))
+                self.aliases.setdefault(key, set()).add(pid)
+
+    def alias_targets(self, vendor, product):
+        """Products the (vendor, product) of the query was renamed to."""
+        if not vendor or not product or not self.aliases:
+            return set()
+        v = _strip_vendor_suffixes(vendor)
+        targets = set()
+        for variant in product_variants(vendor, product):
+            targets |= self.aliases.get((v, compact_key(variant)), set())
+        return targets
 
     def lexical_candidates(self, vendor, product):
         """Products whose name matches the query exactly (modulo separators/case)."""
@@ -517,6 +589,7 @@ class CPEMatcher:
             'fallback_model_path': _path('Paths', 'FALLBACK_MODEL_PATH'),
             'json_filepath': _path('Paths', 'CPE_DATA_JSON'),
             'xml_filepath': _path('Paths', 'CPE_DICTIONARY_XML'),
+            'aliases_filepath': _path('Paths', 'CPE_ALIASES_CSV'),
             'embeddings_dir': _path('Paths', 'EMBEDDINGS_DIR'),
             'batch_size': config.getint('Settings', 'BATCH_SIZE'),
             'num_results': config.getint('Settings', 'NUM_RESULTS'),
@@ -601,15 +674,17 @@ class CPEMatcher:
             self.cpe_items, self.titles = self._load_cpe_data()
         if self.cpe_items is None:
             print("Parsing XML dictionary...")
-            self.cpe_items, self.titles = self._load_cpe_xml(cfg['xml_filepath'])
+            self.cpe_items, self.titles, aliases = self._load_cpe_xml(cfg['xml_filepath'])
             if self.cpe_items is None:
                 return
             self._save_cpe_data()
+            save_aliases(cfg['aliases_filepath'], aliases)
 
         _t = time.time()
         self.index = ProductIndex(self.cpe_items, self.titles)
         print(f"  Product index: {len(self.index)} products from {len(self.cpe_items)} CPEs "
               f"({time.time()-_t:.2f}s)")
+        self.index.set_aliases(load_aliases(cfg['aliases_filepath']))
 
         self.embeddings = self._load_or_build_embeddings(force)
         if _FAISS_AVAILABLE:
@@ -660,28 +735,34 @@ class CPEMatcher:
     def _load_cpe_xml(self, filepath):
         if not os.path.exists(filepath):
             print(f"Error: XML not found: {filepath}")
-            return None, None
+            return None, None, []
         import xml.etree.ElementTree as ET
         ns_item = '{http://cpe.mitre.org/dictionary/2.0}cpe-item'
         ns_title = '{http://cpe.mitre.org/dictionary/2.0}title'
         ns_23 = '{http://scap.nist.gov/schema/cpe-extension/2.3}cpe23-item'
         cpe_items, titles = [], []
+        active, deprecated = Counter(), Counter()
         try:
             for _, elem in ET.iterparse(filepath, events=('end',)):
                 if elem.tag != ns_item:
                     continue
-                if elem.get('deprecated') != 'true':
-                    cpe23 = elem.find(ns_23)
-                    if cpe23 is not None and cpe23.get('name'):
+                cpe23 = elem.find(ns_23)
+                if cpe23 is not None and cpe23.get('name'):
+                    parts = split_cpe(cpe23.get('name'))
+                    key = tuple(parts[2:5])
+                    if elem.get('deprecated') == 'true':
+                        deprecated[key] += 1
+                    else:
+                        active[key] += 1
                         title_el = elem.find(ns_title)
                         cpe_items.append(cpe23.get('name'))
                         titles.append(title_el.text if title_el is not None else "")
                 elem.clear()
         except Exception as e:
             print(f"Error parsing XML: {e}")
-            return None, None
+            return None, None, []
         print(f"Extracted {len(cpe_items)} items.")
-        return cpe_items, titles
+        return cpe_items, titles, build_aliases(active, deprecated)
 
     def _load_or_build_embeddings(self, force=False):
         """
@@ -777,11 +858,13 @@ class CPEMatcher:
                 qi = todo[start + row]
                 vendor, product, version = queries[qi]
                 sims = dict(zip(top_ids[row].tolist(), top_sims[row].tolist()))
-                extra = [pid for pid in self.index.lexical_candidates(vendor, product) if pid not in sims]
+                aliased = self.index.alias_targets(vendor, product)
+                extra = [pid for pid in self.index.lexical_candidates(vendor, product) | aliased
+                         if pid not in sims]
                 if extra:
                     sims.update(zip(extra, (self.embeddings[extra] @ q[row]).tolist()))
                 sims.pop(-1, None)
-                results[qi] = self._rank(vendor, product, version, sims, num_results)
+                results[qi] = self._rank(vendor, product, version, sims, num_results, aliased)
         if len(todo) == 1:
             print(f"  Query embedding: {t_enc:.3f}s, scoring: {time.time()-_t:.3f}s")
         else:
@@ -803,31 +886,44 @@ class CPEMatcher:
             ids = np.tile(np.arange(sims.shape[1]), (sims.shape[0], 1))
         return ids, np.take_along_axis(sims, ids, axis=1)
 
-    def _rank(self, vendor, product, version, sims, num_results):
-        """sims: {product id: cosine similarity} for every candidate product."""
+    def _rank(self, vendor, product, version, sims, num_results, aliased=frozenset()):
+        """
+        sims: {product id: cosine similarity} for every candidate product.
+        aliased: products the queried vendor was renamed to (vendor treated as matching).
+        """
         cfg = self.config
         variants = product_variants(vendor, product)
         norm_products = {compact_key(v) for v in variants}
+        raw_products = {product_key(v) for v in variants}
         scored = []
         for pid, sem in sims.items():
             part, c_vendor, c_product = self.index.keys[pid]
             sem = float(sem)
             v_score = vendor_similarity(vendor, c_vendor) if vendor else 0.5
             p_score = max(product_similarity(v, c_product) for v in variants)
+            if compact_key(c_vendor) == compact_key(c_product):
+                # NVD names the vendor after the product (7-zip:7-zip, putty:putty):
+                # the inventory vendor ('Igor Pavlov') is not expected to match it.
+                v_score = max(v_score, 0.9 * p_score)
+            if pid in aliased:
+                v_score = 1.0
             identity = (sem * cfg['semantic_weight'] + v_score * cfg['vendor_weight']
                         + p_score * cfg['product_weight'])
-            is_exact = compact_key(c_product) in norm_products
-            scored.append((is_exact, identity, pid, sem, v_score, p_score))
+            # 2: same name ('node.js'), 1: same modulo separators ('nodejs'), 0: other
+            exact_level = (2 if product_key(c_product) in raw_products
+                           else 1 if compact_key(c_product) in norm_products else 0)
+            scored.append((exact_level, identity, pid, sem, v_score, p_score))
 
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        out = []
-        for is_exact, identity, pid, sem, v_score, p_score in scored[:num_results]:
+        ranked = []
+        # The version score can reorder close candidates: resolve a wider pool before cutting.
+        for exact_level, identity, pid, sem, v_score, p_score in scored[:max(num_results, 10)]:
             cpe, ver_score, in_dict, ref = self.index.resolve_version(pid, version)
-            out.append({
+            ranked.append((exact_level, {
                 'score': identity + ver_score * cfg['version_weight'],
                 'cpe': cpe,
                 'title': self.index.display_titles[pid],
-                'is_exact_product_match': is_exact,
+                'is_exact_product_match': exact_level > 0,
                 'version_in_dictionary': in_dict,
                 'reference_cpe': ref,
                 'score_breakdown': {
@@ -836,9 +932,9 @@ class CPEMatcher:
                     'product': float(p_score),
                     'version': float(ver_score),
                 },
-            })
-        out.sort(key=lambda r: (r['is_exact_product_match'], r['score']), reverse=True)
-        return out
+            }))
+        ranked.sort(key=lambda x: (x[0], x[1]['score']), reverse=True)
+        return [r for _, r in ranked[:num_results]]
 
     # -- batch Excel -------------------------------------------------------
 

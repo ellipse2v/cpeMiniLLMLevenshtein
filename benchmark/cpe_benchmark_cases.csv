@@ -49,7 +49,7 @@ substituted,redis,redis,8.0.99,a:redis:redis,false
 substituted,rarlab,winrar,7.99,a:rarlab:winrar,false
 substituted,7-zip,7-zip,9.99,a:7-zip:7-zip,false
 substituted,putty,putty,0.99,a:putty:putty,false
-substituted,nginx,nginx,1.9.99,a:nginx:nginx,false
+substituted,nginx,nginx,1.9.99,a:nginx:nginx|a:f5:nginx,false
 substituted,gimp,gimp,3.1.99,a:gimp:gimp,false
 substituted,mozilla,thunderbird,91.99,a:mozilla:thunderbird,false
 substituted,apple,itunes,9.2.99,a:apple:itunes,false

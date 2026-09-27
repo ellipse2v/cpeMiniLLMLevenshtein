@@ -156,6 +156,8 @@ SAMPLE_CPES = [
     ("cpe:2.3:a:adobe:flash_player:20.0.0.306:*:*:*:*:chrome:*:*", "Adobe Flash Player 20.0.0.306 for Chrome"),
     ("cpe:2.3:a:gnu:g\\+\\+:3.3.3:*:*:*:*:*:*:*", "GNU G++ 3.3.3"),
     ("cpe:2.3:o:microsoft:windows_11:-:*:*:*:*:*:*:*", "Microsoft Windows 11"),
+    ("cpe:2.3:a:7-zip:7-zip:9.38:*:*:*:*:*:*:*", "7-Zip 9.38"),
+    ("cpe:2.3:a:f5:nginx:1.9.9:*:*:*:*:*:*:*", "F5 Nginx 1.9.9"),
 ]
 
 
@@ -174,6 +176,22 @@ class TestCpeHelpers(unittest.TestCase):
         self.assertEqual(escape_cpe_value("2019 SP1"), "2019_sp1")
         self.assertEqual(escape_cpe_value("10.3(16)"), "10.3\\(16\\)")
         self.assertEqual(escape_cpe_value(""), "*")
+
+    def test_escape_cpe_value_already_escaped(self):
+        from src.cpe_matcher.cpe_matcher import escape_cpe_value
+        self.assertEqual(escape_cpe_value("6.0\\(2\\)u6\\(5\\)"), "6.0\\(2\\)u6\\(5\\)")
+
+    def test_product_similarity_acronym(self):
+        from src.cpe_matcher.cpe_matcher import product_similarity
+        self.assertGreaterEqual(product_similarity("GNU Image Manipulation Program", "gimp"), 0.9)
+        self.assertGreaterEqual(product_similarity("IIS", "internet_information_services"), 0.9)
+        self.assertLess(product_similarity("Office", "internet_information_services"), 0.5)
+
+    def test_vendor_exact_beats_suffix_stripped(self):
+        from src.cpe_matcher.cpe_matcher import vendor_similarity
+        self.assertGreater(vendor_similarity("apache", "apache"),
+                           vendor_similarity("apache", "apache_software_foundation"))
+        self.assertGreater(vendor_similarity("Microsoft Corporation", "microsoft"), 0.9)
 
     def test_normalize_version_key(self):
         from src.cpe_matcher.cpe_matcher import normalize_version_key
@@ -194,6 +212,32 @@ class TestCpeHelpers(unittest.TestCase):
         self.assertEqual(strip_version_from_title("GNU libgomp 4.8.5", ["4.8.5"]), "GNU libgomp")
 
 
+class TestAliases(unittest.TestCase):
+    """Vendor renames derived from NVD deprecations (nginx:nginx -> f5:nginx)."""
+
+    def test_build_aliases(self):
+        from src.cpe_matcher.cpe_matcher import build_aliases
+        active = {('a', 'f5', 'nginx'): 9, ('a', 'mattermost', 'confluence'): 5,
+                  ('a', 'x', 'dup'): 3, ('a', 'y', 'dup'): 3}
+        deprecated = {('a', 'nginx', 'nginx'): 10, ('a', 'atlassian', 'confluence'): 100,
+                      ('a', 'z', 'dup'): 3, ('a', 'f5', 'nginx'): 1}
+        self.assertEqual(build_aliases(active, deprecated),
+                         [(('a', 'nginx', 'nginx'), ('a', 'f5', 'nginx'))])
+
+    def test_save_keeps_manual_rows(self):
+        from src.cpe_matcher.cpe_matcher import save_aliases, load_aliases
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, 'aliases.csv')
+            with open(path, 'w', newline='') as f:
+                f.write("part,old_vendor,old_product,new_vendor,new_product,source\n"
+                        "a,igor_pavlov,7-zip,7-zip,7-zip,manual\n"
+                        "a,old,thing,new,thing,auto\n")
+            save_aliases(path, [(('a', 'nginx', 'nginx'), ('a', 'f5', 'nginx'))])
+            rows = load_aliases(path)
+        self.assertEqual([(r['old_vendor'], r['source']) for r in rows],
+                         [('igor_pavlov', 'manual'), ('nginx', 'auto')])
+
+
 class TestProductIndex(unittest.TestCase):
 
     @classmethod
@@ -205,7 +249,7 @@ class TestProductIndex(unittest.TestCase):
         return next(i for i, k in enumerate(self.index.keys) if k[2] == product)
 
     def test_one_entry_per_product(self):
-        self.assertEqual(len(self.index), 6)
+        self.assertEqual(len(self.index), 8)
         self.assertEqual(self.index.texts[self._pid('internet_explorer')], "microsoft internet explorer")
 
     def test_known_version_returns_dictionary_cpe(self):
@@ -276,6 +320,25 @@ class TestCPEMatcherOffline(unittest.TestCase):
         self.assertFalse(top['version_in_dictionary'])
         self.assertGreater(top['score'], self.matcher.config['min_score_threshold'])
 
+    def test_product_named_vendor_ignores_inventory_vendor(self):
+        """NVD uses the product as vendor (7-zip:7-zip): 'Igor Pavlov' must not be penalised."""
+        top = self.matcher.search('Igor Pavlov', '7-Zip', '9.38', num_results=1)[0]
+        self.assertEqual(top['cpe'], "cpe:2.3:a:7-zip:7-zip:9.38:*:*:*:*:*:*:*")
+        self.assertGreaterEqual(top['score_breakdown']['vendor'], 0.9)
+
+    def test_alias_redirects_renamed_vendor(self):
+        m = self.matcher
+        pid_f5 = m.index.key_to_id[('a', 'f5', 'nginx')]
+        m.index.set_aliases([{'part': 'a', 'old_vendor': 'nginx', 'old_product': 'nginx',
+                              'new_vendor': 'f5', 'new_product': 'nginx', 'source': 'auto'}])
+        try:
+            self.assertEqual(m.index.alias_targets('Nginx Inc.', 'nginx'), {pid_f5})
+            top = m.search('nginx', 'nginx', '1.9.99', num_results=1)[0]
+        finally:
+            m.index.set_aliases([])
+        self.assertEqual(top['cpe'], "cpe:2.3:a:f5:nginx:1.9.99:*:*:*:*:*:*:*")
+        self.assertEqual(top['score_breakdown']['vendor'], 1.0)
+
     def test_vendor_prefix_in_product(self):
         results = self.matcher.search('Microsoft Corporation', 'Microsoft SQL Server', '2019')
         self.assertEqual(results[0]['cpe'], "cpe:2.3:a:microsoft:sql_server:2019:*:*:*:*:*:*:*")
@@ -285,6 +348,28 @@ class TestCPEMatcherOffline(unittest.TestCase):
         results = self.matcher.search('microsoft', 'internet explorer', '6', num_results=5)
         prods = [r['cpe'].split(':')[4] for r in results]
         self.assertEqual(len(prods), len(set(prods)))
+
+    def test_version_counts_before_truncation(self):
+        """num_results=1 must not drop the product that has the requested version."""
+        from src.cpe_matcher.cpe_matcher import ProductIndex
+        m = self.matcher
+        saved = m.index, m.embeddings
+        items = ["cpe:2.3:a:apache:tomcat:6.0.44:*:*:*:*:*:*:*",
+                 "cpe:2.3:a:apache_software_foundation:tomcat:1.0:*:*:*:*:*:*:*"]
+        m.index = ProductIndex(items, ["", ""])
+        # Semantic 0.95 vs 1.0: identity alone favours the second product,
+        # the known version must tip the balance back to the first one.
+        q = m._encode(["apache tomcat"])[0]
+        other = np.zeros_like(q)
+        other[int(np.argmin(np.abs(q)))] = 1.0
+        other -= other.dot(q) * q
+        other /= np.linalg.norm(other)
+        m.embeddings = np.stack([0.95 * q + np.sqrt(1 - 0.95 ** 2) * other, q]).astype(np.float32)
+        try:
+            top = m.search('apache', 'tomcat', '6.0.44', num_results=1)[0]
+        finally:
+            m.index, m.embeddings = saved
+        self.assertEqual(top['cpe'], "cpe:2.3:a:apache:tomcat:6.0.44:*:*:*:*:*:*:*")
 
     def test_batch_equals_single(self):
         queries = [('mozilla', 'firefox', '100.0'), ('gnu', 'g++', '9.1'), ('', '', '')]
