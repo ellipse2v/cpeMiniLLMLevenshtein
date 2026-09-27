@@ -224,6 +224,9 @@ def generate_cpe_dictionary():
 
                 # For XML output
                 cpe_item = SubElement(root, "cpe-item", name=cpe_uri)
+                if cpe_data.get("deprecated"):
+                    # Skipped by cpe_matcher: NVD replaced this name by another one
+                    cpe_item.set("deprecated", "true")
 
                 # Add titles
                 for title_data in cpe_data.get("titles", []):

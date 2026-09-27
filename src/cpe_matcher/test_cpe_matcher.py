@@ -123,7 +123,195 @@ class TestVersionSimilarity(unittest.TestCase):
         self.assertEqual(self.version_similarity("10.0.1", "*"), 0.5)
 
 
+def _has_sentence_transformers():
+    try:
+        import sentence_transformers  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+class FakeEncoder:
+    """Deterministic character-trigram encoder, stands in for sentence-transformers."""
+    name = 'fake-trigram'
+
+    def encode(self, texts, **_kwargs):
+        import zlib
+        out = np.zeros((len(texts), 256), dtype=np.float32)
+        for i, t in enumerate(texts):
+            t = f"  {t.lower()} "
+            for j in range(len(t) - 2):
+                out[i, zlib.crc32(t[j:j + 3].encode()) % 256] += 1.0
+        return out
+
+
+SAMPLE_CPES = [
+    ("cpe:2.3:a:microsoft:internet_explorer:6:*:*:*:*:*:*:*", "Microsoft Internet Explorer 6"),
+    ("cpe:2.3:a:microsoft:internet_explorer:6:sp1:*:*:*:*:*:*", "Microsoft Internet Explorer 6 SP1"),
+    ("cpe:2.3:a:microsoft:internet_explorer:5.01:sp4:*:*:*:*:*:*", "Microsoft Internet Explorer 5.01 Service Pack 4"),
+    ("cpe:2.3:a:microsoft:internet_explorer:4.0:*:*:*:*:*:*:*", "Microsoft Internet Explorer 4.0"),
+    ("cpe:2.3:a:microsoft:internet_explorer:11:-:*:*:*:*:*:*", "Microsoft Internet Explorer 11"),
+    ("cpe:2.3:a:microsoft:sql_server:2019:*:*:*:*:*:*:*", "Microsoft SQL Server 2019"),
+    ("cpe:2.3:a:mozilla:firefox:99.0:*:*:*:*:*:*:*", "Mozilla Firefox 99.0"),
+    ("cpe:2.3:a:adobe:flash_player:20.0.0.306:*:*:*:*:chrome:*:*", "Adobe Flash Player 20.0.0.306 for Chrome"),
+    ("cpe:2.3:a:gnu:g\\+\\+:3.3.3:*:*:*:*:*:*:*", "GNU G++ 3.3.3"),
+    ("cpe:2.3:o:microsoft:windows_11:-:*:*:*:*:*:*:*", "Microsoft Windows 11"),
+]
+
+
+class TestCpeHelpers(unittest.TestCase):
+
+    def test_split_cpe_honours_escapes(self):
+        from src.cpe_matcher.cpe_matcher import split_cpe
+        parts = split_cpe("cpe:2.3:a:cisco:ios:10.3\\(16\\):*:*:*:*:*:*:*")
+        self.assertEqual(len(parts), 13)
+        self.assertEqual(parts[5], "10.3\\(16\\)")
+        parts = split_cpe("cpe:2.3:a:vendor:prod\\:uct:1.0:*:*:*:*:*:*:*")
+        self.assertEqual(parts[4], "prod\\:uct")
+
+    def test_escape_cpe_value(self):
+        from src.cpe_matcher.cpe_matcher import escape_cpe_value
+        self.assertEqual(escape_cpe_value("2019 SP1"), "2019_sp1")
+        self.assertEqual(escape_cpe_value("10.3(16)"), "10.3\\(16\\)")
+        self.assertEqual(escape_cpe_value(""), "*")
+
+    def test_normalize_version_key(self):
+        from src.cpe_matcher.cpe_matcher import normalize_version_key
+        self.assertEqual(normalize_version_key("4.0"), normalize_version_key("4"))
+        self.assertEqual(normalize_version_key("4.0.0"), "4")
+        self.assertNotEqual(normalize_version_key("4.01"), normalize_version_key("4.1"))
+
+    def test_product_variants_strip_vendor(self):
+        from src.cpe_matcher.cpe_matcher import product_variants
+        self.assertEqual(product_variants("Microsoft Corporation", "Microsoft SQL Server"),
+                         ["Microsoft SQL Server", "SQL Server"])
+        self.assertEqual(product_variants("", "Firefox"), ["Firefox"])
+
+    def test_strip_version_from_title(self):
+        from src.cpe_matcher.cpe_matcher import strip_version_from_title
+        self.assertEqual(strip_version_from_title("Microsoft Internet Explorer 6 SP1", ["6", "sp1"]),
+                         "Microsoft Internet Explorer")
+        self.assertEqual(strip_version_from_title("GNU libgomp 4.8.5", ["4.8.5"]), "GNU libgomp")
+
+
+class TestProductIndex(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        from src.cpe_matcher.cpe_matcher import ProductIndex
+        cls.index = ProductIndex([c for c, _ in SAMPLE_CPES], [t for _, t in SAMPLE_CPES])
+
+    def _pid(self, product):
+        return next(i for i, k in enumerate(self.index.keys) if k[2] == product)
+
+    def test_one_entry_per_product(self):
+        self.assertEqual(len(self.index), 6)
+        self.assertEqual(self.index.texts[self._pid('internet_explorer')], "microsoft internet explorer")
+
+    def test_known_version_returns_dictionary_cpe(self):
+        cpe, score, in_dict, _ = self.index.resolve_version(self._pid('internet_explorer'), '6')
+        self.assertEqual(cpe, "cpe:2.3:a:microsoft:internet_explorer:6:*:*:*:*:*:*:*")
+        self.assertTrue(in_dict)
+        self.assertEqual(score, 1.0)
+
+    def test_trailing_zero_version_is_known(self):
+        cpe, _, in_dict, _ = self.index.resolve_version(self._pid('internet_explorer'), '4')
+        self.assertTrue(in_dict)
+        self.assertEqual(cpe, "cpe:2.3:a:microsoft:internet_explorer:4.0:*:*:*:*:*:*:*")
+
+    def test_unknown_version_is_substituted(self):
+        """IE 3 is not in the sample dictionary: a valid CPE is built for it."""
+        cpe, score, in_dict, ref = self.index.resolve_version(self._pid('internet_explorer'), '3')
+        self.assertEqual(cpe, "cpe:2.3:a:microsoft:internet_explorer:3:*:*:*:*:*:*:*")
+        self.assertFalse(in_dict)
+        self.assertEqual(ref, "cpe:2.3:a:microsoft:internet_explorer:4.0:*:*:*:*:*:*:*")
+        self.assertTrue(0.5 <= score < 1.0)
+
+    def test_platform_specific_version_gives_generic_cpe(self):
+        cpe, _, in_dict, ref = self.index.resolve_version(self._pid('flash_player'), '20.0.0.306')
+        self.assertEqual(cpe, "cpe:2.3:a:adobe:flash_player:20.0.0.306:*:*:*:*:*:*:*")
+        self.assertTrue(in_dict)
+        self.assertIn(":chrome:", ref)
+
+    def test_escaped_product(self):
+        pid = self._pid('g\\+\\+')
+        self.assertIn(pid, self.index.lexical_candidates('gnu', 'g++'))
+        cpe, _, _, _ = self.index.resolve_version(pid, '9.1')
+        self.assertEqual(cpe, "cpe:2.3:a:gnu:g\\+\\+:9.1:*:*:*:*:*:*:*")
+
+    def test_no_version(self):
+        cpe, _, in_dict, _ = self.index.resolve_version(self._pid('firefox'), '')
+        self.assertEqual(cpe, "cpe:2.3:a:mozilla:firefox:*:*:*:*:*:*:*:*")
+        self.assertFalse(in_dict)
+
+
+class TestCPEMatcherOffline(unittest.TestCase):
+    """End-to-end search with an injected encoder and a tiny dictionary."""
+
+    @classmethod
+    def setUpClass(cls):
+        from src.cpe_matcher.cpe_matcher import CPEMatcher
+        cls.tmpdir = tempfile.TemporaryDirectory()
+        json_path = os.path.join(cls.tmpdir.name, 'cpe_data.json.gz')
+        payload = json.dumps({'cpe_items': [c for c, _ in SAMPLE_CPES],
+                              'titles': [t for _, t in SAMPLE_CPES]}).encode('utf-8')
+        with gzip.open(json_path, 'wb') as f:
+            f.write(payload)
+        cfg = os.path.join(cls.tmpdir.name, 'config.ini')
+        with open(cfg, 'w') as f:
+            f.write(f"[Paths]\nCPE_DATA_JSON = {json_path}\nEMBEDDINGS_DIR = {cls.tmpdir.name}\n"
+                    f"CPE_DICTIONARY_XML = {os.path.join(cls.tmpdir.name, 'none.xml')}\n")
+        cls.matcher = CPEMatcher(config_path=cfg, model=FakeEncoder())
+        cls.matcher.load_data()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmpdir.cleanup()
+
+    def test_substituted_version_is_found(self):
+        results = self.matcher.search('microsoft', 'internet explorer', '3')
+        self.assertTrue(results)
+        top = results[0]
+        self.assertEqual(top['cpe'], "cpe:2.3:a:microsoft:internet_explorer:3:*:*:*:*:*:*:*")
+        self.assertFalse(top['version_in_dictionary'])
+        self.assertGreater(top['score'], self.matcher.config['min_score_threshold'])
+
+    def test_vendor_prefix_in_product(self):
+        results = self.matcher.search('Microsoft Corporation', 'Microsoft SQL Server', '2019')
+        self.assertEqual(results[0]['cpe'], "cpe:2.3:a:microsoft:sql_server:2019:*:*:*:*:*:*:*")
+        self.assertTrue(results[0]['version_in_dictionary'])
+
+    def test_one_result_per_product(self):
+        results = self.matcher.search('microsoft', 'internet explorer', '6', num_results=5)
+        prods = [r['cpe'].split(':')[4] for r in results]
+        self.assertEqual(len(prods), len(set(prods)))
+
+    def test_batch_equals_single(self):
+        queries = [('mozilla', 'firefox', '100.0'), ('gnu', 'g++', '9.1'), ('', '', '')]
+        batch = self.matcher.search_batch(queries, num_results=1)
+        self.assertEqual(batch[0][0]['cpe'], self.matcher.search(*queries[0], num_results=1)[0]['cpe'])
+        self.assertEqual(batch[1][0]['cpe'], "cpe:2.3:a:gnu:g\\+\\+:9.1:*:*:*:*:*:*:*")
+        self.assertEqual(batch[2], [])
+
+    def test_embeddings_are_reused_incrementally(self):
+        from src.cpe_matcher.cpe_matcher import ProductIndex
+        m = self.matcher
+        m.index = ProductIndex(m.cpe_items + ["cpe:2.3:a:videolan:vlc_media_player:3.0.9:*:*:*:*:*:*:*"],
+                               m.titles + ["VideoLAN VLC media player 3.0.9"])
+        calls = []
+        original = m.model.encode
+        m.model.encode = lambda texts, **kw: (calls.append(list(texts)), original(texts))[1]
+        try:
+            emb = m._load_or_build_embeddings()
+        finally:
+            m.model.encode = original
+        self.assertEqual(emb.shape[0], len(m.index))
+        self.assertEqual(calls, [["videolan vlc media player"]])
+
+
+@unittest.skipUnless(_has_sentence_transformers(), "sentence-transformers not installed")
 class TestCPEMatcher(unittest.TestCase):
+    """Full end-to-end test (requires the model and cpe_data.json.gz)."""
 
     @classmethod
     def setUpClass(cls):
@@ -137,11 +325,13 @@ class TestCPEMatcher(unittest.TestCase):
         from src.cpe_matcher.cpe_matcher import parse_cpe_name
         results = self.matcher.search('microsoft', 'windows_11', '22000', num_results=10)
         self.assertTrue(results)
-        for r in results[:5]:
-            _, p, _ = parse_cpe_name(r['cpe'])
-            self.assertEqual(p, 'windows_11', f"Expected windows_11, got {p}")
-        _, top_product, _ = parse_cpe_name(results[0]['cpe'])
+        _, top_product, top_version = parse_cpe_name(results[0]['cpe'])
         self.assertEqual(top_product, 'windows_11')
+        self.assertEqual(top_version, '22000')
+
+    def test_internet_explorer_unknown_version(self):
+        results = self.matcher.search('microsoft', 'internet explorer', '2.5', num_results=1)
+        self.assertEqual(results[0]['cpe'], "cpe:2.3:a:microsoft:internet_explorer:2.5:*:*:*:*:*:*:*")
 
     def test_search_returns_score_breakdown(self):
         results = self.matcher.search('microsoft', 'windows_11', '22000', num_results=1)
@@ -156,36 +346,6 @@ class TestCPEMatcher(unittest.TestCase):
         self.assertIsInstance(t, float)
         self.assertGreater(t, 0.0)
         self.assertLessEqual(t, 1.0)
-
-
-class TestFAISSSearch(unittest.TestCase):
-
-    def test_faiss_top1_matches_brute_force(self):
-        """FAISS inner-product top-1 must agree with brute-force cosine."""
-        try:
-            import faiss
-        except ImportError:
-            self.skipTest("faiss-cpu not installed")
-
-        from sklearn.metrics.pairwise import cosine_similarity as sklearn_cos
-
-        np.random.seed(42)
-        n, dim = 200, 64
-        vecs = np.random.rand(n, dim).astype(np.float32)
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        vecs_norm = vecs / norms
-
-        query = np.random.rand(1, dim).astype(np.float32)
-        query_norm = query / np.linalg.norm(query)
-
-        bf_top = int(sklearn_cos(query_norm, vecs_norm)[0].argmax())
-
-        index = faiss.IndexFlatIP(dim)
-        index.add(vecs_norm)
-        _, faiss_ids = index.search(query_norm, 1)
-        faiss_top = int(faiss_ids[0][0])
-
-        self.assertEqual(bf_top, faiss_top)
 
 
 if __name__ == '__main__':
