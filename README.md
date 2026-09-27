@@ -4,7 +4,7 @@ Match software names and versions to NVD CPE identifiers using a hybrid semantic
 
 ## Features
 
-- **Product-level index**: the NVD dictionary has ~1.5 M CPE names but only ~145 k distinct `part:vendor:product` triples. One embedding is computed per product (10× fewer vectors, ~220 MB instead of ~2.2 GB for MiniLM)
+- **Product-level index**: the NVD dictionary has ~1.8 M CPE names but only ~150 k distinct `part:vendor:product` triples. One embedding is computed per product (10× fewer vectors, ~220 MB instead of ~2.2 GB for MiniLM)
 - **Version substitution**: once the product is identified, the requested version is looked up in the dictionary. If NVD does not list it, a valid CPE is built from the product with the version substituted (e.g. Internet Explorer `2.0` → `cpe:2.3:a:microsoft:internet_explorer:2.0:*:*:*:*:*:*:*`). Results say whether the version was found (`version_in_dictionary`) and which dictionary entry was used (`reference_cpe`)
 - **Hybrid scoring**: semantic cosine similarity (sentence-transformers) + Levenshtein vendor/product matching (company suffixes such as *Inc.*, *Corporation* ignored, vendor name stripped from the product: *Microsoft SQL Server* → *sql server*) + numeric version comparison
 - **Batch search**: Excel rows are encoded and compared in batches (one matrix product per chunk, FAISS when installed) instead of one query at a time
@@ -38,7 +38,7 @@ cpeMiniLLMLevenshtein/
 ├── benchmark/
 │   ├── cpe_benchmark_cases.csv     # Labelled queries (exact, substituted, variants, typos, negatives)
 │   └── run_benchmark.py            # Accuracy + timing, before/after comparison
-├── cpe_data.json.gz                # CPE metadata cache (gzip + JSON)
+├── cpe_data.json.gz                # CPE metadata cache (gzip + JSON), versioned — see "CPE data"
 ├── cpe_data.json.gz.sha256         # Integrity check for the cache
 ├── cpe_product_embeddings_<model>.npy        # One embedding per product (generated)
 ├── cpe_product_embeddings_<model>.texts.json.gz  # Texts of those embeddings (incremental reuse)
@@ -105,6 +105,20 @@ python src/cpe_matcher/cpe_matcher.py
 
 `--limit 5000` fetches only the first N CPEs (for testing).
 
+Commit `cpe_data.json.gz` and `cpe_data.json.gz.sha256` together (the hash must match or the cache is rejected). Never commit `src/generate_cpe_dictionary/config.ini` once it holds your API key.
+
+### CPE data
+
+`cpe_data.json.gz` is versioned so that a fresh clone works without the XML (~900 MB) or an NVD API key; the product embeddings are computed on first run (~30 s on GPU).
+
+| | |
+|---|---|
+| Snapshot | NVD API, 2026-09-27 |
+| CPEs fetched | 1,846,965 |
+| Deprecated (excluded) | 102,108 |
+| Active CPEs in cache | 1,744,857 |
+| Distinct products | 150,645 |
+
 ## Configuration (`config.ini`)
 
 `src/cpe_matcher/config.ini` is optional: every key has a built-in default.
@@ -147,7 +161,7 @@ Keys of older config files (`CPE_EMBEDDINGS_NUMPY`, `MAX_WORKERS`, `FAISS_MIN_RO
 ## How It Works
 
 1. **Load** `cpe_data.json.gz` (or parse the XML dictionary, skipping deprecated entries)
-2. **Group** the ~1.5 M CPE names by `part:vendor:product` (~145 k products); each product gets a version-less text (`vendor product title`) and a map of its known versions
+2. **Group** the ~1.7 M active CPE names by `part:vendor:product` (~150 k products); each product gets a version-less text (`vendor product title`) and a map of its known versions
 3. **Encode** one embedding per product — saved once, only new products are encoded after an update
 4. **At query time** — encode `vendor product` (batched in Excel mode), take the `SEMANTIC_TOP_K` closest products plus the products whose name matches exactly (modulo case/separators, with and without the vendor prefix)
 5. **Re-rank** candidates with Levenshtein vendor/product similarity; exact product-name matches first
@@ -190,6 +204,22 @@ python benchmark/run_benchmark.py --label after
 
 python benchmark/run_benchmark.py --compare benchmark/results_before.json benchmark/results_after.json
 ```
+
+### Results (2026-09-27, all-MiniLM-L6-v2 on CUDA, same NVD dictionary of 1,736,681 CPEs for both versions)
+
+| Category | Correct before → after |
+|---|---|
+| exact | 100.0 → 100.0 |
+| substituted | 100.0 → 100.0 |
+| variant | 88.0 → 92.0 |
+| variant_substituted | 60.0 → 86.7 |
+| typo | 100.0 → 100.0 |
+| negative | 100.0 → 100.0 |
+| **All (113)** | **92.0 → 96.5** |
+
+- Right product ranked first: 96.4 % → 98.2 %; in top 5: 98.2 % → 100 %. 5 cases fixed, 0 regressed (threshold 0.7).
+- Batch: 8.4 → 225 rows/s (~27×); single query ~1.8 s → ~40 ms.
+- `MIN_SCORE_THRESHOLD` lowered to 0.6: invented software scores ≤ 0.56, correct products ≥ 0.64.
 
 The comparison prints accuracy per category, timings (data load, mean query latency, batch throughput over `--repeat` × the cases) and the list of cases fixed/regressed. `--fake-model` runs the new version offline with a hashing encoder (sanity check only).
 
